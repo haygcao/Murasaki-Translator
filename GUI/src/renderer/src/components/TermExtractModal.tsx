@@ -102,8 +102,7 @@ export function TermExtractModal({
       const file = files[0];
       const ext = file.name.split(".").pop()?.toLowerCase();
       if (ext === "txt" || ext === "epub" || ext === "ass" || ext === "srt") {
-        // @ts-ignore - Electron provides path property
-        const filePath = file.path;
+        const filePath = window.electron?.webUtils?.getPathForFile?.(file) || "";
         if (filePath) {
           setSelectedFile(filePath);
           setSourceType("upload");
@@ -117,7 +116,7 @@ export function TermExtractModal({
 
   // Listen for progress updates
   useEffect(() => {
-    // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
     const unsubscribe = window.api?.onTermExtractProgress?.((p: number) => {
       setProgress(p);
     });
@@ -129,7 +128,7 @@ export function TermExtractModal({
 
   const handleFileSelect = async () => {
     try {
-      // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
       const result = await window.api.selectFile({
         title: tt.selectFileTitle,
         filters: [
@@ -159,7 +158,7 @@ export function TermExtractModal({
     setResults([]);
 
     try {
-      // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
       const result = await window.api.extractTerms({
         filePath: selectedFile,
         topK: 500,

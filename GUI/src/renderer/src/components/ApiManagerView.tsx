@@ -9,6 +9,7 @@
 import yaml from "js-yaml";
 import type { ComponentProps, ComponentType, ReactNode } from "react";
 import { Button, Input as BaseInput, Label, Tooltip, Card } from "./ui/core";
+import { Select } from "./ui/Select";
 import { translations, Language } from "../lib/i18n";
 import { emitToast } from "../lib/toast";
 import {
@@ -33,6 +34,7 @@ import {
   Code2,
   Zap,
   Cpu,
+  CircleHelp,
   Gauge,
   Clock,
   Thermometer,
@@ -42,7 +44,6 @@ import {
   Scissors,
   Loader2,
   ArrowRight,
-  Check,
   RotateCcw,
   Play,
 } from "lucide-react";
@@ -61,11 +62,6 @@ import {
   type PipelineSummary,
   resolvePipelineTranslationMode,
 } from "../lib/pipelineProfile";
-import {
-  buildPromptLegacyParts,
-  shouldPreserveLegacyPromptParts,
-  type PromptLegacyParts,
-} from "../lib/promptProfile";
 import {
   parseJsonlPreviewLines,
   parseJsonPreviewValue,
@@ -110,19 +106,16 @@ const SelectField = ({
   className,
   children,
   ...props
-}: ComponentProps<"select">) => (
-  <div className="relative">
-    <select
-      className={cn(
-        "flex h-9 w-full appearance-none rounded-md border border-input bg-background px-3 py-1 pr-8 text-sm shadow-sm transition-colors hover:bg-muted/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-        className,
-      )}
-      {...props}
-    >
-      {children}
-    </select>
-    <ChevronDown className="pointer-events-none absolute right-3 top-2.5 h-4 w-4 text-muted-foreground" />
-  </div>
+}: ComponentProps<typeof Select>) => (
+  <Select
+    className={cn(
+      "flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors hover:bg-muted/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+      className,
+    )}
+    {...props}
+  >
+    {children}
+  </Select>
 );
 
 type InputAffixProps = Omit<ComponentProps<typeof BaseInput>, "prefix"> & {
@@ -153,6 +146,25 @@ const InputAffix = ({
         {suffix}
       </div>
     )}
+  </div>
+);
+
+type LabelWithInfoProps = {
+  label: string;
+  info?: string;
+  className?: string;
+};
+
+const LabelWithInfo = ({ label, info, className }: LabelWithInfoProps) => (
+  <div className={cn("flex items-center gap-1.5", className)}>
+    <Label>{label}</Label>
+    {info ? (
+      <Tooltip content={info}>
+        <span className="inline-flex cursor-help text-muted-foreground hover:text-foreground transition-colors">
+          <CircleHelp className="h-3.5 w-3.5" />
+        </span>
+      </Tooltip>
+    ) : null}
   </div>
 );
 
@@ -229,6 +241,18 @@ const parseJsonValueMaybe = (raw: string) => {
   }
 };
 
+const parseBooleanFlag = (value: unknown, fallback = false): boolean => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (!text) return fallback;
+  if (["1", "true", "yes", "on"].includes(text)) return true;
+  if (["0", "false", "no", "off"].includes(text)) return false;
+  return fallback;
+};
+
 const pairsToJson = (pairs: KeyValuePair[]) => {
   const payload: Record<string, string> = {};
   for (const pair of pairs) {
@@ -273,6 +297,7 @@ type ApiFormState = {
   params: string;
   timeout: string;
   concurrency: string;
+  strictConcurrency: boolean;
   maxRetries: string;
   rpm: string;
   temperature: string;
@@ -324,6 +349,10 @@ type PipelineComposerState = {
   seed: string;
   stop: string;
   extraParams: string;
+  kanaRetryEnabled: boolean;
+  kanaRetryThreshold: string;
+  kanaRetryMinChars: string;
+  kanaRetrySourceLang: string;
 };
 
 type PromptFormState = {
@@ -368,6 +397,10 @@ type ChunkFormState = {
   enableBalance: boolean;
   balanceThreshold: string;
   balanceCount: string;
+  kanaRetryEnabled: boolean;
+  kanaRetryThreshold: string;
+  kanaRetryMinChars: string;
+  kanaRetrySourceLang: string;
 };
 
 type ParserRuleType =
@@ -526,6 +559,7 @@ api_key: ""
 model: ""
 timeout: 600
 concurrency: 0
+strict_concurrency: false
 max_retries: 3
 rpm: 3600
 headers: {}
@@ -574,7 +608,11 @@ name: 默认分块策略
 chunk_type: block
 options:
   target_chars: 1000
-  max_chars: 2000`,
+  max_chars: 2000
+  kana_retry_enabled: true
+  kana_retry_threshold: 0.3
+  kana_retry_min_chars: 32
+  kana_retry_source_lang: ja`,
 };
 
 const DEFAULT_API_FORM: ApiFormState = {
@@ -590,6 +628,7 @@ const DEFAULT_API_FORM: ApiFormState = {
   params: "",
   timeout: "",
   concurrency: "0",
+  strictConcurrency: false,
   maxRetries: "3",
   rpm: "3600",
   temperature: "",
@@ -624,6 +663,10 @@ const DEFAULT_PIPELINE_COMPOSER: PipelineComposerState = {
   seed: "",
   stop: "",
   extraParams: "",
+  kanaRetryEnabled: true,
+  kanaRetryThreshold: "0.3",
+  kanaRetryMinChars: "32",
+  kanaRetrySourceLang: "ja",
 };
 
 const DEFAULT_PROMPT_FORM: PromptFormState = {
@@ -668,6 +711,10 @@ const DEFAULT_CHUNK_FORM: ChunkFormState = {
   enableBalance: true,
   balanceThreshold: "0.6",
   balanceCount: "3",
+  kanaRetryEnabled: true,
+  kanaRetryThreshold: "0.3",
+  kanaRetryMinChars: "32",
+  kanaRetrySourceLang: "ja",
 };
 
 const createParserRuleTemplate = (
@@ -812,7 +859,7 @@ const GrokFaviconIcon = ({ className }: { className?: string }) => (
 
 const TEMPLATE_CUSTOM_KEY = "murasaki.v2.custom_templates";
 const TEMPLATE_HIDDEN_KEY = "murasaki.v2.hidden_templates";
-const ACTIVE_PIPELINE_KEY = "murasaki.v2.active_pipeline_id";
+const ACTIVE_PIPELINE_KEY = "config_v2_pipeline_id";
 const PARSER_RECOMMEND_KEY = "murasaki.v2.parser_recommend_visible";
 const PROFILE_ORDER_KEY = "murasaki.v2.profile_order";
 const SHOW_ID_FIELDS_KEY = "murasaki.v2.show_id_fields";
@@ -1481,7 +1528,7 @@ const validateProfile = (
   }
 
   if (kind === "chunk") {
-    const rawChunkType = String(data.chunk_type || data.type || "");
+    const rawChunkType = String(data.chunk_type || "");
     const normalizedChunkType = normalizeChunkType(rawChunkType);
     if (!rawChunkType.trim()) errors.push(missingField("chunk_type"));
     if (rawChunkType.trim() && !normalizedChunkType) {
@@ -2109,8 +2156,6 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
     useState<PipelineComposerState>(DEFAULT_PIPELINE_COMPOSER);
   const [promptForm, setPromptForm] =
     useState<PromptFormState>(DEFAULT_PROMPT_FORM);
-  const [promptLegacyParts, setPromptLegacyParts] =
-    useState<PromptLegacyParts | null>(null);
   const [promptPreview, setPromptPreview] = useState<PromptPreviewState>(
     DEFAULT_PROMPT_PREVIEW,
   );
@@ -2249,9 +2294,13 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
   const [parserPreview, setParserPreview] =
     useState<ParserPreviewResult | null>(null);
   const [editorTab, setEditorTab] = useState<"visual" | "yaml">("visual");
-  const [activePipelineId, setActivePipelineId] = useState<string>(() =>
-    loadJson(ACTIVE_PIPELINE_KEY, ""),
-  );
+  const [activePipelineId, setActivePipelineId] = useState<string>(() => {
+    try {
+      return window.localStorage.getItem(ACTIVE_PIPELINE_KEY) || "";
+    } catch {
+      return "";
+    }
+  });
   const [pendingPipelineLink, setPendingPipelineLink] = useState(false);
   const loadProfilesSeq = useRef(0);
   const pipelineIndexSeq = useRef(0);
@@ -2283,7 +2332,11 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
   ]);
 
   useEffect(() => {
-    persistJson(ACTIVE_PIPELINE_KEY, activePipelineId);
+    try {
+      window.localStorage.setItem(ACTIVE_PIPELINE_KEY, activePipelineId);
+    } catch {
+      // ignore
+    }
   }, [activePipelineId]);
 
   useEffect(() => {
@@ -2617,7 +2670,7 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
   const loadChunkTypeIndex = async (
     chunkIds: string[],
     requestId?: number,
-    preloadList?: Array<{ id?: string; chunk_type?: string; type?: string }>,
+    preloadList?: Array<{ id?: string; chunk_type?: string }>,
   ) => {
     if (!chunkIds.length) {
       if (!requestId || requestId === loadProfilesSeq.current) {
@@ -2630,7 +2683,7 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
       preloadList.forEach((item) => {
         const rawId = item?.id ? String(item.id) : "";
         if (!rawId) return;
-        const rawType = String(item.chunk_type || item.type || "");
+        const rawType = String(item.chunk_type || "");
         const normalized = normalizeChunkType(rawType);
         if (normalized) preloaded.set(rawId, normalized);
       });
@@ -2679,7 +2732,7 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
           const data =
             result?.data ??
             (result?.yaml ? (safeLoadYaml(result.yaml) as any) : null);
-          const raw = String(data?.chunk_type || data?.type || "");
+          const raw = String(data?.chunk_type || "");
           const normalized = normalizeChunkType(raw);
           return [id, normalized] as [string, "" | "line" | "block"];
         } catch {
@@ -3942,7 +3995,6 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
     }
     if (targetKind === "prompt") {
       setPromptForm(DEFAULT_PROMPT_FORM);
-      setPromptLegacyParts(null);
       setPromptPreview(DEFAULT_PROMPT_PREVIEW);
       return;
     }
@@ -4157,7 +4209,8 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
     const trimmed = String(value || "").trim();
     if (!trimmed) return "";
     const base = trimmed.toLowerCase().split(/[-_]/)[0];
-    if (base === "ja" || base === "jp") return base;
+    // 前端统一展示 ja，继续兼容历史 jp 配置输入。
+    if (base === "ja" || base === "jp") return "ja";
     return trimmed;
   };
 
@@ -4444,6 +4497,7 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
           data.concurrency !== undefined && data.concurrency !== null
             ? String(data.concurrency)
             : "",
+        strictConcurrency: parseBooleanFlag(data.strict_concurrency, false),
         maxRetries:
           data.max_retries !== undefined && data.max_retries !== null
             ? String(data.max_retries)
@@ -4504,6 +4558,23 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
       const extraParamObject = extraParamEntries.length
         ? Object.fromEntries(extraParamEntries)
         : {};
+      const processing =
+        data.processing &&
+        typeof data.processing === "object" &&
+        !Array.isArray(data.processing)
+          ? data.processing
+          : {};
+      const rawKanaRetryEnabled = parseBooleanFlag(
+        processing.kana_retry_enabled ?? processing.kanaRetryEnabled,
+        DEFAULT_PIPELINE_COMPOSER.kanaRetryEnabled,
+      );
+      const rawKanaRetryThreshold =
+        processing.kana_retry_threshold ?? processing.kanaRetryThreshold;
+      const rawKanaRetryMinChars =
+        processing.kana_retry_min_chars ?? processing.kanaRetryMinChars;
+      const rawKanaRetrySourceLang = normalizeSourceLang(
+        String(processing.source_lang ?? processing.sourceLang ?? "ja"),
+      );
       lastValidJsonRef.current.pipelineHeaders = pipelineHeaders as Record<
         string,
         any
@@ -4554,16 +4625,25 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
         extraParams: extraParamEntries.length
           ? JSON.stringify(extraParamObject, null, 2)
           : "",
+        kanaRetryEnabled: rawKanaRetryEnabled,
+        kanaRetryThreshold:
+          rawKanaRetryThreshold !== undefined && rawKanaRetryThreshold !== null
+            ? String(rawKanaRetryThreshold)
+            : DEFAULT_PIPELINE_COMPOSER.kanaRetryThreshold,
+        kanaRetryMinChars:
+          rawKanaRetryMinChars !== undefined && rawKanaRetryMinChars !== null
+            ? String(rawKanaRetryMinChars)
+            : DEFAULT_PIPELINE_COMPOSER.kanaRetryMinChars,
+        kanaRetrySourceLang:
+          rawKanaRetrySourceLang || DEFAULT_PIPELINE_COMPOSER.kanaRetrySourceLang,
       });
     }
     if (targetKind === "prompt") {
       const context = data.context || {};
-      const { combined, legacy } = buildPromptLegacyParts(data);
-      setPromptLegacyParts(legacy);
       setPromptForm({
         id: data.id || "",
         name: data.name || "",
-        systemTemplate: combined,
+        systemTemplate: data.system_template || "",
         userTemplate: data.user_template || "",
         beforeLines: String(context.before_lines ?? "0"),
         afterLines: String(context.after_lines ?? "0"),
@@ -4638,6 +4718,41 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
     }
     if (targetKind === "chunk") {
       const options = data.options || {};
+      const pipelineProcessingRaw = lastProfileDataRef.current.pipeline?.processing;
+      const pipelineProcessing =
+        pipelineProcessingRaw &&
+        typeof pipelineProcessingRaw === "object" &&
+        !Array.isArray(pipelineProcessingRaw)
+          ? pipelineProcessingRaw
+          : {};
+      const rawKanaRetryEnabled = parseBooleanFlag(
+        options.kana_retry_enabled ??
+          options.kanaRetryEnabled ??
+          pipelineProcessing.kana_retry_enabled ??
+          pipelineProcessing.kanaRetryEnabled,
+        DEFAULT_CHUNK_FORM.kanaRetryEnabled,
+      );
+      const rawKanaRetryThreshold =
+        options.kana_retry_threshold ??
+        options.kanaRetryThreshold ??
+        pipelineProcessing.kana_retry_threshold ??
+        pipelineProcessing.kanaRetryThreshold;
+      const rawKanaRetryMinChars =
+        options.kana_retry_min_chars ??
+        options.kanaRetryMinChars ??
+        pipelineProcessing.kana_retry_min_chars ??
+        pipelineProcessing.kanaRetryMinChars;
+      const rawKanaRetrySourceLang = normalizeSourceLang(
+        String(
+          options.kana_retry_source_lang ??
+            options.kanaRetrySourceLang ??
+            options.source_lang ??
+            options.sourceLang ??
+            pipelineProcessing.source_lang ??
+            pipelineProcessing.sourceLang ??
+            "ja",
+        ),
+      );
       setChunkForm({
         id: data.id || "",
         name: data.name || "",
@@ -4649,6 +4764,17 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
             : true,
         balanceThreshold: String(options.balance_threshold ?? "0.6"),
         balanceCount: String(options.balance_count ?? "3"),
+        kanaRetryEnabled: rawKanaRetryEnabled,
+        kanaRetryThreshold:
+          rawKanaRetryThreshold !== undefined && rawKanaRetryThreshold !== null
+            ? String(rawKanaRetryThreshold)
+            : DEFAULT_CHUNK_FORM.kanaRetryThreshold,
+        kanaRetryMinChars:
+          rawKanaRetryMinChars !== undefined && rawKanaRetryMinChars !== null
+            ? String(rawKanaRetryMinChars)
+            : DEFAULT_CHUNK_FORM.kanaRetryMinChars,
+        kanaRetrySourceLang:
+          rawKanaRetrySourceLang || DEFAULT_CHUNK_FORM.kanaRetrySourceLang,
       });
     }
   };
@@ -4978,6 +5104,7 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
           payload.concurrency = newForm.concurrency;
         }
       }
+      payload.strict_concurrency = Boolean(newForm.strictConcurrency);
       if (newForm.maxRetries !== "") {
         const rawMaxRetries = Number.parseInt(newForm.maxRetries, 10);
         if (Number.isFinite(rawMaxRetries)) {
@@ -5010,6 +5137,7 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
           "params",
           "timeout",
           "concurrency",
+          "strict_concurrency",
           "max_retries",
           "rpm",
           "requests_per_minute",
@@ -5067,6 +5195,7 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
         "apply_line_policy",
         "line_policy",
         "settings",
+        "processing",
       ]);
       const lastData = lastProfileDataRef.current.pipeline;
       if (lastData && typeof lastData === "object") {
@@ -5081,6 +5210,15 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
       if (resolvedComposer.linePolicy) {
         payload.line_policy = resolvedComposer.linePolicy;
       }
+    }
+
+    const processingBaseRaw = lastProfileDataRef.current.pipeline?.processing;
+    if (
+      processingBaseRaw &&
+      typeof processingBaseRaw === "object" &&
+      !Array.isArray(processingBaseRaw)
+    ) {
+      payload.processing = { ...processingBaseRaw };
     }
 
     const settings: any = {};
@@ -5218,27 +5356,13 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
       id: newForm.id,
       name: newForm.name,
       user_template: newForm.userTemplate,
+      system_template: newForm.systemTemplate,
       context: {
         before_lines: toNumber(newForm.beforeLines, 0),
         after_lines: toNumber(newForm.afterLines, 0),
         joiner: resolvedJoiner || "\n",
       },
     };
-    const preserveLegacy = shouldPreserveLegacyPromptParts(
-      promptLegacyParts,
-      newForm.systemTemplate,
-    );
-    if (preserveLegacy && promptLegacyParts) {
-      if (promptLegacyParts.persona)
-        payload.persona = promptLegacyParts.persona;
-      if (promptLegacyParts.styleRules)
-        payload.style_rules = promptLegacyParts.styleRules;
-      if (promptLegacyParts.outputRules)
-        payload.output_rules = promptLegacyParts.outputRules;
-      payload.system_template = promptLegacyParts.systemTemplate;
-    } else {
-      payload.system_template = newForm.systemTemplate;
-    }
     if (resolvedSourceFormat) {
       payload.context.source_format = resolvedSourceFormat;
     }
@@ -5289,29 +5413,51 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
   };
 
   const updateYamlFromChunkForm = (newForm: ChunkFormState) => {
-    setChunkForm(newForm);
+    const normalizedSourceLang = normalizeSourceLang(newForm.kanaRetrySourceLang);
+    const nextForm = { ...newForm, kanaRetrySourceLang: normalizedSourceLang };
+    setChunkForm(nextForm);
     try {
       const previousChunkTypeRaw =
-        lastProfileDataRef.current.chunk?.chunk_type ??
-        lastProfileDataRef.current.chunk?.type;
+        lastProfileDataRef.current.chunk?.chunk_type;
       const resolvedChunkType =
         normalizeChunkType(previousChunkTypeRaw) || "block";
       const payload: any = {
-        id: newForm.id,
-        name: newForm.name,
+        id: nextForm.id,
+        name: nextForm.name,
         chunk_type: resolvedChunkType,
       };
       const options: any = {};
-      const target = parseInt(newForm.targetChars, 10);
+      const target = parseInt(nextForm.targetChars, 10);
       if (Number.isFinite(target)) options.target_chars = target;
-      const maxChars = parseInt(newForm.maxChars, 10);
+      const maxChars = parseInt(nextForm.maxChars, 10);
       if (Number.isFinite(maxChars)) options.max_chars = maxChars;
-      options.enable_balance = newForm.enableBalance;
-      const balanceThreshold = Number(newForm.balanceThreshold);
+      options.enable_balance = nextForm.enableBalance;
+      const balanceThreshold = Number(nextForm.balanceThreshold);
       if (Number.isFinite(balanceThreshold))
         options.balance_threshold = balanceThreshold;
-      const balanceCount = parseInt(newForm.balanceCount, 10);
+      const balanceCount = parseInt(nextForm.balanceCount, 10);
       if (Number.isFinite(balanceCount)) options.balance_count = balanceCount;
+      if (resolvedChunkType === "block") {
+        options.kana_retry_enabled = Boolean(nextForm.kanaRetryEnabled);
+        const kanaRetryThreshold = Number(nextForm.kanaRetryThreshold);
+        if (Number.isFinite(kanaRetryThreshold) && kanaRetryThreshold >= 0) {
+          const normalizedThreshold =
+            kanaRetryThreshold > 1
+              ? kanaRetryThreshold / 100
+              : kanaRetryThreshold;
+          options.kana_retry_threshold = Math.min(
+            1,
+            Math.max(0, normalizedThreshold),
+          );
+        }
+        const kanaRetryMinChars = parseInt(nextForm.kanaRetryMinChars, 10);
+        if (Number.isFinite(kanaRetryMinChars) && kanaRetryMinChars >= 1) {
+          options.kana_retry_min_chars = kanaRetryMinChars;
+        }
+        if (nextForm.kanaRetrySourceLang.trim()) {
+          options.kana_retry_source_lang = nextForm.kanaRetrySourceLang.trim();
+        }
+      }
       if (Object.keys(options).length) payload.options = options;
       queueYamlDump(payload);
     } catch {
@@ -5847,7 +5993,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label>{texts.formFields.concurrencyLabel}</Label>
+              <LabelWithInfo
+                label={texts.formFields.concurrencyLabel}
+                info={texts.formTooltips.concurrency}
+              />
               <InputAffix
                 type="number"
                 value={apiForm.concurrency}
@@ -5867,7 +6016,31 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
             </div>
 
             <div className="space-y-2">
-              <Label>{texts.formFields.rpmLabel}</Label>
+              <LabelWithInfo
+                label={texts.formFields.strictConcurrencyLabel}
+                info={texts.formTooltips.strictConcurrency}
+              />
+              <div className="flex h-9 items-center justify-between rounded-md border border-input bg-background px-3 py-1">
+                <span className="text-xs text-muted-foreground">
+                  {texts.formHints.strictConcurrency}
+                </span>
+                <Switch
+                  checked={apiForm.strictConcurrency}
+                  onCheckedChange={(checked) =>
+                    updateYamlFromApiForm({
+                      ...apiForm,
+                      strictConcurrency: Boolean(checked),
+                    })
+                  }
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <LabelWithInfo
+                label={texts.formFields.rpmLabel}
+                info={texts.formTooltips.rpm}
+              />
               <InputAffix
                 type="number"
                 value={apiForm.rpm}
@@ -5887,7 +6060,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
             </div>
 
             <div className="space-y-2">
-              <Label>{texts.formFields.maxRetriesLabel}</Label>
+              <LabelWithInfo
+                label={texts.formFields.maxRetriesLabel}
+                info={texts.formTooltips.maxRetries}
+              />
               <InputAffix
                 type="number"
                 value={apiForm.maxRetries}
@@ -5904,26 +6080,6 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
               />
               <p className="text-xs text-muted-foreground whitespace-pre-line">
                 {texts.formHints.maxRetries}
-              </p>
-            </div>
-
-            <div className="space-y-2">
-              <Label>{texts.formFields.timeoutLabel}</Label>
-              <InputAffix
-                type="number"
-                value={apiForm.timeout}
-                onChange={(e) =>
-                  updateYamlFromApiForm({
-                    ...apiForm,
-                    timeout: e.target.value,
-                  })
-                }
-                placeholder={texts.formPlaceholders.timeout}
-                prefix={<Clock className="h-3.5 w-3.5" />}
-                suffix="s"
-              />
-              <p className="text-xs text-muted-foreground whitespace-pre-line">
-                {texts.formHints.timeout}
               </p>
             </div>
           </div>
@@ -5982,7 +6138,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
               </div>
             )}
             <div className="space-y-2">
-              <Label>{texts.formFields.baseUrlLabel}</Label>
+              <LabelWithInfo
+                label={texts.formFields.baseUrlLabel}
+                info={texts.formTooltips.baseUrl}
+              />
               <Input
                 value={apiForm.baseUrl}
                 onChange={(e) =>
@@ -5995,7 +6154,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
               </p>
             </div>
             <div className="space-y-2">
-              <Label>{texts.formFields.apiKeyLabel}</Label>
+              <LabelWithInfo
+                label={texts.formFields.apiKeyLabel}
+                info={texts.formTooltips.apiKey}
+              />
               <textarea
                 spellCheck={false}
                 className="flex min-h-[96px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -6148,7 +6310,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
             </div>
             <div className="space-y-2">
               <div className="flex items-center justify-between gap-2">
-                <Label>{texts.formFields.modelLabel}</Label>
+                <LabelWithInfo
+                  label={texts.formFields.modelLabel}
+                  info={texts.formTooltips.model}
+                />
                 <Button
                   size="sm"
                   variant="outline"
@@ -6266,7 +6431,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                       )}
                     </div>
                     <div className="space-y-2">
-                      <Label>{texts.formFields.baseUrlLabel}</Label>
+                      <LabelWithInfo
+                        label={texts.formFields.baseUrlLabel}
+                        info={texts.formTooltips.baseUrl}
+                      />
                       <Input
                         value={endpoint.baseUrl}
                         onChange={(e) => {
@@ -6339,7 +6507,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                       </div>
                     </div>
                     <div className="space-y-2">
-                      <Label>{texts.formFields.apiKeyLabel}</Label>
+                      <LabelWithInfo
+                        label={texts.formFields.apiKeyLabel}
+                        info={texts.formTooltips.apiKey}
+                      />
                       <textarea
                         spellCheck={false}
                         className="flex min-h-[96px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -6425,21 +6596,43 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
               </div>
 
               {apiAdvancedTab === "extras" && (
-                <div className="space-y-2">
-                  <Label>{texts.formFields.groupLabel}</Label>
-                  <Input
-                    value={apiForm.group}
-                    onChange={(e) =>
-                      updateYamlFromApiForm({
-                        ...apiForm,
-                        group: e.target.value,
-                      })
-                    }
-                    placeholder={texts.formPlaceholders.group}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    {texts.formHints.group}
-                  </p>
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label>{texts.formFields.timeoutLabel}</Label>
+                    <InputAffix
+                      type="number"
+                      value={apiForm.timeout}
+                      onChange={(e) =>
+                        updateYamlFromApiForm({
+                          ...apiForm,
+                          timeout: e.target.value,
+                        })
+                      }
+                      placeholder={texts.formPlaceholders.timeout}
+                      prefix={<Clock className="h-3.5 w-3.5" />}
+                      suffix="s"
+                    />
+                    <p className="text-xs text-muted-foreground whitespace-pre-line">
+                      {texts.formHints.timeout}
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>{texts.formFields.groupLabel}</Label>
+                    <Input
+                      value={apiForm.group}
+                      onChange={(e) =>
+                        updateYamlFromApiForm({
+                          ...apiForm,
+                          group: e.target.value,
+                        })
+                      }
+                      placeholder={texts.formPlaceholders.group}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {texts.formHints.group}
+                    </p>
+                  </div>
                 </div>
               )}
 
@@ -6469,6 +6662,9 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                         placeholder={texts.apiSamplingPlaceholders.temperature}
                         prefix={<Thermometer className="h-3.5 w-3.5" />}
                       />
+                      <p className="text-xs text-muted-foreground">
+                        {texts.apiSamplingHints.temperature}
+                      </p>
                     </div>
                     <div className="space-y-2">
                       <Label>{texts.apiSamplingFields.topP}</Label>
@@ -6485,6 +6681,9 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                         placeholder={texts.apiSamplingPlaceholders.topP}
                         prefix={<Percent className="h-3.5 w-3.5" />}
                       />
+                      <p className="text-xs text-muted-foreground">
+                        {texts.apiSamplingHints.topP}
+                      </p>
                     </div>
                     <div className="space-y-2">
                       <Label>{texts.apiSamplingFields.maxTokens}</Label>
@@ -6502,6 +6701,9 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                         prefix={<Hash className="h-3.5 w-3.5" />}
                         suffix="tok"
                       />
+                      <p className="text-xs text-muted-foreground">
+                        {texts.apiSamplingHints.maxTokens}
+                      </p>
                     </div>
                     <div className="space-y-2">
                       <Label>{texts.apiSamplingFields.presencePenalty}</Label>
@@ -6520,6 +6722,9 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                         }
                         prefix={<Activity className="h-3.5 w-3.5" />}
                       />
+                      <p className="text-xs text-muted-foreground">
+                        {texts.apiSamplingHints.presencePenalty}
+                      </p>
                     </div>
                     <div className="space-y-2">
                       <Label>{texts.apiSamplingFields.frequencyPenalty}</Label>
@@ -6538,6 +6743,9 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                         }
                         prefix={<Zap className="h-3.5 w-3.5" />}
                       />
+                      <p className="text-xs text-muted-foreground">
+                        {texts.apiSamplingHints.frequencyPenalty}
+                      </p>
                     </div>
                     <div className="space-y-2">
                       <Label>{texts.apiSamplingFields.seed}</Label>
@@ -6555,6 +6763,9 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                         prefix={<Hash className="h-3.5 w-3.5" />}
                         suffix="#"
                       />
+                      <p className="text-xs text-muted-foreground">
+                        {texts.apiSamplingHints.seed}
+                      </p>
                     </div>
                     <div className="space-y-2 col-span-2">
                       <Label>{texts.apiSamplingFields.stop}</Label>
@@ -6568,6 +6779,9 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                         }
                         placeholder={texts.apiSamplingPlaceholders.stop}
                       />
+                      <p className="text-xs text-muted-foreground">
+                        {texts.apiSamplingHints.stop}
+                      </p>
                     </div>
                   </div>
                 </div>
@@ -6575,6 +6789,9 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
 
               {apiAdvancedTab === "headers" && (
                 <div className="space-y-4">
+                  <p className="text-xs text-muted-foreground">
+                    {texts.formHints.headers}
+                  </p>
                   <KVEditor
                     label={texts.formFields.headersLabel}
                     pairs={headerPairs}
@@ -6582,6 +6799,9 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                     strings={kvStrings}
                     showHint={false}
                   />
+                  <p className="text-xs text-muted-foreground">
+                    {texts.formHints.params}
+                  </p>
                   <KVEditor
                     label={texts.formFields.paramsLabel}
                     pairs={paramPairs}
@@ -7402,27 +7622,17 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
     ) => (
       <div
         className={cn(
-          "relative flex flex-col rounded-xl border transition-all duration-200",
+          "relative flex flex-col rounded-xl border transition-colors duration-200",
           checked
-            ? "border-primary/40 bg-primary/[0.03]"
-            : "border-border/60 bg-card hover:bg-accent/40",
+            ? "border-primary/40 bg-background"
+            : "border-border/60 bg-background hover:bg-accent/20",
         )}
       >
         <div
           onClick={() => onChange(!checked)}
-          className="flex items-start gap-4 p-4 cursor-pointer select-none"
+          className="flex items-center justify-between gap-3 p-4 cursor-pointer select-none"
         >
-          <div
-            className={cn(
-              "mt-1 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 transition-all duration-300",
-              checked
-                ? "bg-primary border-primary text-white scale-110"
-                : "border-muted-foreground/30 bg-transparent",
-            )}
-          >
-            {checked && <Check className="h-3 w-3 stroke-[3]" />}
-          </div>
-          <div className="space-y-1 flex-1">
+          <div className="space-y-1 pr-2">
             <div className="text-sm font-medium leading-none text-foreground">
               {label}
             </div>
@@ -7430,11 +7640,16 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
               {desc}
             </p>
           </div>
+          <Switch
+            checked={checked}
+            onCheckedChange={onChange}
+            onClick={(event) => event.stopPropagation()}
+          />
         </div>
 
         {checked && children && (
           <div className="px-4 pb-4 pt-0 animate-in fade-in zoom-in-95 duration-200">
-            <div className="h-px bg-primary/10 mb-4" />
+            <div className="h-px bg-border/60 mb-4" />
             {children}
           </div>
         )}
@@ -7606,10 +7821,8 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                 <div className="space-y-4 pt-2">
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
-                      <Label>
-                        {texts.policyFields.similarityThresholdLabel}
-                      </Label>
-                      <span className="text-xs font-mono bg-background border rounded px-1.5 py-0.5 shadow-sm">
+                      <Label>{texts.policyFields.similarityThresholdLabel}</Label>
+                      <span className="text-xs font-mono bg-background border rounded px-1.5 py-0.5">
                         {policyForm.similarityThreshold}
                       </span>
                     </div>
@@ -7677,6 +7890,12 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
 
   const renderChunkForm = () => {
     const showChunkId = showIdField.chunk;
+    const currentChunkType =
+      normalizeChunkType(lastProfileDataRef.current.chunk?.chunk_type) ||
+      "block";
+    const isBlockChunk = currentChunkType === "block";
+    const kanaRetrySourceLang =
+      normalizeSourceLang(chunkForm.kanaRetrySourceLang) || "ja";
 
     const updateChunk = (patch: Partial<ChunkFormState>) =>
       updateYamlFromChunkForm({ ...chunkForm, ...patch });
@@ -7687,18 +7906,26 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
       label: string,
       hint?: string,
       children?: React.ReactNode,
+      disabled = false,
     ) => (
       <div
         className={cn(
-          "relative flex flex-col rounded-xl border transition-all duration-200",
+          "relative flex flex-col rounded-xl border transition-colors duration-200",
           checked
-            ? "border-primary/40 bg-primary/[0.03]"
-            : "border-border/60 bg-card hover:bg-accent/40",
+            ? "border-primary/40 bg-background"
+            : "border-border/60 bg-background hover:bg-accent/20",
+          disabled && "opacity-60",
         )}
       >
         <div
-          className="flex items-center justify-between p-4 cursor-pointer select-none"
-          onClick={() => onChange(!checked)}
+          className={cn(
+            "flex items-center justify-between p-4 select-none",
+            disabled ? "cursor-not-allowed" : "cursor-pointer",
+          )}
+          onClick={() => {
+            if (disabled) return;
+            onChange(!checked);
+          }}
         >
           <div className="space-y-0.5">
             <div className="text-sm font-medium text-foreground">{label}</div>
@@ -7706,12 +7933,17 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
               <div className="text-xs text-muted-foreground">{hint}</div>
             )}
           </div>
-          <Switch checked={checked} onCheckedChange={onChange} />
+          <Switch
+            checked={checked}
+            onCheckedChange={onChange}
+            disabled={disabled}
+            onClick={(event) => event.stopPropagation()}
+          />
         </div>
 
         {checked && children && (
           <div className="px-4 pb-4 pt-0 animate-in fade-in zoom-in-95 duration-200">
-            <div className="h-px bg-primary/10 mb-4" />
+            <div className="h-px bg-border/60 mb-4" />
             {children}
           </div>
         )}
@@ -7763,7 +7995,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
               <div className="space-y-2">
-                <Label>{texts.chunkFields.targetCharsLabel}</Label>
+                <LabelWithInfo
+                  label={texts.chunkFields.targetCharsLabel}
+                  info={texts.chunkTooltips.targetChars}
+                />
                 <Input
                   type="number"
                   className="font-mono"
@@ -7775,7 +8010,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                 </p>
               </div>
               <div className="space-y-2">
-                <Label>{texts.chunkFields.maxCharsLabel}</Label>
+                <LabelWithInfo
+                  label={texts.chunkFields.maxCharsLabel}
+                  info={texts.chunkTooltips.maxChars}
+                />
                 <Input
                   type="number"
                   className="font-mono"
@@ -7808,7 +8046,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                 // In-Card Settings
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-8 pt-2">
                   <div className="space-y-2">
-                    <Label>{texts.chunkFields.balanceThresholdLabel}</Label>
+                    <LabelWithInfo
+                      label={texts.chunkFields.balanceThresholdLabel}
+                      info={texts.chunkTooltips.balanceThreshold}
+                    />
                     <Input
                       type="number"
                       step="0.1"
@@ -7823,7 +8064,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                     </p>
                   </div>
                   <div className="space-y-2">
-                    <Label>{texts.chunkFields.balanceCountLabel}</Label>
+                    <LabelWithInfo
+                      label={texts.chunkFields.balanceCountLabel}
+                      info={texts.chunkTooltips.balanceCount}
+                    />
                     <Input
                       type="number"
                       className="text-lg font-mono"
@@ -7839,6 +8083,84 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
                 </div>,
               )}
             </div>
+          </div>
+
+          <div className="pt-8 border-t border-primary/5 space-y-4">
+            <div className="space-y-1">
+              <div className="text-sm font-semibold text-foreground/80">
+                {texts.composer.sections.qualityTitle}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {isBlockChunk
+                  ? texts.composer.sections.qualityDesc
+                  : texts.composer.hints.kanaRetryLineDisabled}
+              </p>
+            </div>
+            {renderSwitchCard(
+              chunkForm.kanaRetryEnabled,
+              (checked) => updateChunk({ kanaRetryEnabled: Boolean(checked) }),
+              texts.composer.fields.kanaRetryLabel,
+              isBlockChunk
+                ? texts.composer.hints.kanaRetry
+                : texts.composer.hints.kanaRetryLineDisabled,
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
+                <div className="space-y-2">
+                  <Label>{texts.composer.fields.kanaRetrySourceLangLabel}</Label>
+                  <SelectField
+                    value={kanaRetrySourceLang}
+                    onChange={(e) =>
+                      updateChunk({ kanaRetrySourceLang: e.target.value })
+                    }
+                    disabled={!isBlockChunk}
+                  >
+                    <option value="ja">
+                      {texts.composer.options.kanaRetrySourceLangJa}
+                    </option>
+                  </SelectField>
+                  <p className="text-xs text-muted-foreground">
+                    {texts.composer.hints.kanaRetrySourceLang}
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <Label>{texts.composer.fields.kanaRetryThresholdLabel}</Label>
+                  <InputAffix
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    max="1"
+                    value={chunkForm.kanaRetryThreshold}
+                    onChange={(e) =>
+                      updateChunk({ kanaRetryThreshold: e.target.value })
+                    }
+                    placeholder={texts.composer.placeholders.kanaRetryThreshold}
+                    suffix="%"
+                    disabled={!isBlockChunk}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {texts.composer.hints.kanaRetryThreshold}
+                  </p>
+                </div>
+                <div className="space-y-2 md:col-span-2">
+                  <Label>{texts.composer.fields.kanaRetryMinCharsLabel}</Label>
+                  <InputAffix
+                    type="number"
+                    step="1"
+                    min="1"
+                    value={chunkForm.kanaRetryMinChars}
+                    onChange={(e) =>
+                      updateChunk({ kanaRetryMinChars: e.target.value })
+                    }
+                    placeholder={texts.composer.placeholders.kanaRetryMinChars}
+                    suffix="char"
+                    disabled={!isBlockChunk}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {texts.composer.hints.kanaRetryMinChars}
+                  </p>
+                </div>
+              </div>,
+              !isBlockChunk,
+            )}
           </div>
         </FormSection>
       </div>
@@ -7865,31 +8187,65 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
     setSandboxLoading(true);
     setSandboxResult(null);
     try {
-      const procConfig = (pipelineComposer as any).processing || {};
       const rulesPreLocal = JSON.parse(
         localStorage.getItem("config_rules_pre") || "[]",
       );
       const rulesPostLocal = JSON.parse(
         localStorage.getItem("config_rules_post") || "[]",
       );
+      const sandboxChunkType = inferChunkType(pipelineComposer.chunkPolicy);
+      const chunkFormMatchesPipeline =
+        String(chunkForm.id || "").trim() &&
+        String(chunkForm.id || "").trim() ===
+          String(pipelineComposer.chunkPolicy || "").trim();
+      const sandboxKanaEnabled =
+        sandboxChunkType === "block" && chunkFormMatchesPipeline
+          ? chunkForm.kanaRetryEnabled
+          : pipelineComposer.kanaRetryEnabled;
+      const sandboxKanaSourceLang =
+        sandboxChunkType === "block" && chunkFormMatchesPipeline
+          ? chunkForm.kanaRetrySourceLang
+          : pipelineComposer.kanaRetrySourceLang;
+      const sandboxKanaThresholdRaw =
+        sandboxChunkType === "block" && chunkFormMatchesPipeline
+          ? chunkForm.kanaRetryThreshold
+          : pipelineComposer.kanaRetryThreshold;
+      const sandboxKanaMinCharsRaw =
+        sandboxChunkType === "block" && chunkFormMatchesPipeline
+          ? chunkForm.kanaRetryMinChars
+          : pipelineComposer.kanaRetryMinChars;
+      const sandboxSourceLang =
+        normalizeSourceLang(sandboxKanaSourceLang) || "ja";
+      const kanaRetryThreshold = Number(sandboxKanaThresholdRaw);
+      const resolvedKanaRetryThresholdRaw = Number.isFinite(kanaRetryThreshold)
+        ? kanaRetryThreshold
+        : Number(DEFAULT_PIPELINE_COMPOSER.kanaRetryThreshold);
+      const resolvedKanaRetryThreshold =
+        resolvedKanaRetryThresholdRaw > 1
+          ? resolvedKanaRetryThresholdRaw / 100
+          : resolvedKanaRetryThresholdRaw;
+      const kanaRetryMinChars = Number.parseInt(sandboxKanaMinCharsRaw, 10);
+      const resolvedKanaRetryMinChars = Number.isFinite(kanaRetryMinChars)
+        ? kanaRetryMinChars
+        : Number.parseInt(DEFAULT_PIPELINE_COMPOSER.kanaRetryMinChars, 10);
       const pipelineConfig = {
         ...pipelineComposer,
         provider: pipelineComposer.provider,
         prompt: pipelineComposer.prompt,
         parser: pipelineComposer.parser,
         processing: {
-          rules_pre:
-            procConfig.rules_pre && procConfig.rules_pre.length > 0
-              ? procConfig.rules_pre
-              : rulesPreLocal,
-          rules_post:
-            procConfig.rules_post && procConfig.rules_post.length > 0
-              ? procConfig.rules_post
-              : rulesPostLocal,
-          glossary: procConfig.glossary || [],
-          source_lang: "ja",
-          enable_quality: procConfig.enable_quality,
-          text_protect: procConfig.text_protect,
+          rules_pre: rulesPreLocal,
+          rules_post: rulesPostLocal,
+          glossary: [],
+          source_lang: sandboxSourceLang,
+          kana_retry_enabled: Boolean(sandboxKanaEnabled),
+          kana_retry_threshold: Math.min(
+            1,
+            Math.max(0, resolvedKanaRetryThreshold),
+          ),
+          kana_retry_min_chars: Math.max(1, resolvedKanaRetryMinChars),
+          enable_quality: localStorage.getItem("config_enable_quality") === "true",
+          text_protect: localStorage.getItem("config_text_protect") !== "false",
         },
       };
       const res = await window.api?.pipelineV2SandboxTest?.({
@@ -8474,6 +8830,7 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
               normalizedLinePolicy,
               pipelineComposer.chunkPolicy,
             ),
+            disabled: false,
           },
           ...strategyOptions,
         ];
@@ -8508,7 +8865,6 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
         applyLinePolicy: false,
       });
     };
-
     return (
       <div className="space-y-6">
         <FormSection title={texts.composer.title} desc={texts.composer.desc}>
@@ -8601,7 +8957,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
             </div>
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <Label>{texts.scheme.fields.strategy}</Label>
+                <LabelWithInfo
+                  label={texts.scheme.fields.strategy}
+                  info={texts.formTooltips.strategy}
+                />
                 <button
                   type="button"
                   className="text-xs font-medium text-muted-foreground hover:text-foreground"
@@ -8629,7 +8988,10 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
             </div>
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <Label>{texts.composer.fields.parserLabel}</Label>
+                <LabelWithInfo
+                  label={texts.composer.fields.parserLabel}
+                  info={texts.formTooltips.parser}
+                />
                 <button
                   type="button"
                   className="text-xs font-medium text-muted-foreground hover:text-foreground"
@@ -8661,6 +9023,7 @@ export function ApiManagerView({ lang }: ApiManagerViewProps) {
               </SelectField>
             </div>
           </div>
+
         </FormSection>
         {renderSandboxDebugger()}
       </div>

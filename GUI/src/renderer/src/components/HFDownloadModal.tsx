@@ -15,6 +15,7 @@ import {
 import { Button } from "./ui/core";
 import { cn } from "../lib/utils";
 import { translations } from "../lib/i18n";
+import { sortHfDownloadRepos } from "../lib/hfDownloadRepos";
 
 interface HFRepo {
   id: string;
@@ -105,7 +106,7 @@ export function HFDownloadModal({
       const startTime = Date.now();
       try {
         if (isRemote) {
-          // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
           const result = await window.api?.remoteHfCheckNetwork?.();
           const latency = Date.now() - startTime;
           if (result?.ok && result.data?.status === "ok") {
@@ -118,7 +119,7 @@ export function HFDownloadModal({
             );
           }
         } else {
-          // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
           const result = await window.api?.hfCheckNetwork?.();
           const latency = Date.now() - startTime;
           if (result?.status === "ok") {
@@ -183,10 +184,10 @@ export function HFDownloadModal({
       setStep("files");
     };
 
-    // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
     const unsubscribeProgress =
       window.api?.onHfDownloadProgress?.(handleProgress);
-    // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
     const unsubscribeError = window.api?.onHfDownloadError?.(handleError);
 
     return () => {
@@ -202,7 +203,7 @@ export function HFDownloadModal({
 
     const pollStatus = async () => {
       try {
-        // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
         const result =
           await window.api?.remoteHfDownloadStatus?.(remoteDownloadId);
         if (!result?.ok) {
@@ -251,7 +252,7 @@ export function HFDownloadModal({
     try {
       let payload: any = null;
       if (isRemote) {
-        // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
         const result = await window.api?.remoteHfListRepos?.(orgName);
         if (!result?.ok) {
           setError(result?.message || text.networkError);
@@ -260,11 +261,11 @@ export function HFDownloadModal({
         }
         payload = result?.data;
       } else {
-        // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
         payload = await window.api?.hfListRepos?.(orgName);
       }
       if (payload?.repos) {
-        setRepos(payload.repos);
+        setRepos(sortHfDownloadRepos(payload.repos));
       } else if (payload?.error) {
         setError(payload.error);
       }
@@ -280,7 +281,7 @@ export function HFDownloadModal({
     try {
       let payload: any = null;
       if (isRemote) {
-        // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
         const result = await window.api?.remoteHfListFiles?.(repoId);
         if (!result?.ok) {
           setError(result?.message || text.networkError);
@@ -289,7 +290,7 @@ export function HFDownloadModal({
         }
         payload = result?.data;
       } else {
-        // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
         payload = await window.api?.hfListFiles?.(repoId);
       }
       if (payload?.files) {
@@ -334,7 +335,7 @@ export function HFDownloadModal({
 
     try {
       if (isRemote) {
-        // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
         const result = await window.api?.remoteHfDownloadStart?.(
           selectedRepo.id,
           selectedFile,
@@ -347,7 +348,7 @@ export function HFDownloadModal({
         }
         setRemoteDownloadId(result.data.downloadId);
       } else {
-        // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
         await window.api?.hfDownloadStart?.(
           selectedRepo.id,
           selectedFile,
@@ -364,11 +365,11 @@ export function HFDownloadModal({
     try {
       if (isRemote) {
         if (remoteDownloadId) {
-          // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
           await window.api?.remoteHfDownloadCancel?.(remoteDownloadId);
         }
       } else {
-        // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
         await window.api?.hfDownloadCancel?.();
       }
     } catch (e) {
@@ -545,7 +546,14 @@ export function HFDownloadModal({
               <span className="bg-indigo-500/10 text-indigo-700 px-2 py-0.5 rounded font-medium flex-shrink-0">
                 {text.vramTitle}
               </span>
-              <div className="flex items-center gap-4 text-muted-foreground">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-muted-foreground">
+                <span className="flex items-center gap-1.5">
+                  Murasaki-4B:{" "}
+                  <span className="text-foreground font-semibold">
+                    {text.vram4b}
+                  </span>
+                </span>
+                <span className="w-px h-3 bg-border" />
                 <span className="flex items-center gap-1.5">
                   Murasaki-8B:{" "}
                   <span className="text-foreground font-semibold">

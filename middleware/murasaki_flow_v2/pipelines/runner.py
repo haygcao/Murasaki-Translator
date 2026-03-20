@@ -17,6 +17,13 @@ from murasaki_translator.documents.srt import SrtDocument
 from murasaki_translator.documents.ass import AssDocument
 from murasaki_translator.core.cache import TranslationCache
 from murasaki_translator.core.chunker import TextBlock
+from murasaki_translator.core.anchor_guard import (
+    collect_anchor_ids,
+    normalize_anchor_stream,
+    prepare_local_anchor_context,
+    repair_and_validate_anchor_output,
+    restore_output_anchors,
+)
 
 from murasaki_flow_v2.registry.profile_store import ProfileStore
 from murasaki_flow_v2.providers.registry import ProviderRegistry
@@ -41,10 +48,58 @@ from murasaki_flow_v2.utils.api_stats_protocol import (
 )
 
 MAX_CONCURRENCY = 256
+DEFAULT_KANA_RETRY_THRESHOLD = 0.30
+DEFAULT_KANA_RETRY_MIN_CHARS = 32
+_KANA_CHAR_RE = re.compile(r"[\u3040-\u309F\u30A0-\u30FF]")
+_KANA_RATIO_BASE_RE = re.compile(
+    r"[A-Za-z0-9\u3040-\u309F\u30A0-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]"
+)
 
 
 class PipelineStopRequested(RuntimeError):
     """Raised when an external stop request asks runner to end gracefully."""
+
+
+class KanaResidueRetryError(RuntimeError):
+    """Raised when block output still contains too much kana and should be retried."""
+
+    def __init__(
+        self,
+        *,
+        ratio: float,
+        threshold: float,
+        kana_chars: int,
+        effective_chars: int,
+        min_chars: int,
+    ) -> None:
+        self.ratio = float(ratio)
+        self.threshold = float(threshold)
+        self.kana_chars = int(kana_chars)
+        self.effective_chars = int(effective_chars)
+        self.min_chars = int(min_chars)
+        super().__init__(
+            (
+                "KanaResidue:"
+                f" ratio={self.ratio:.3f}"
+                f" threshold={self.threshold:.3f}"
+                f" kana={self.kana_chars}"
+                f" effective={self.effective_chars}"
+                f" min_chars={self.min_chars}"
+            )
+        )
+
+
+class AnchorIntegrityRetryError(RuntimeError):
+    """Raised when structured anchor repair/validation still fails."""
+
+    def __init__(self, *, meta: Optional[Dict[str, Any]] = None) -> None:
+        self.meta = dict(meta or {})
+        fmt = str(self.meta.get("format") or "anchor")
+        missing = int(self.meta.get("missing_count") or 0)
+        foreign = int(self.meta.get("foreign_count") or 0)
+        super().__init__(
+            f"AnchorMissing: format={fmt} missing={missing} foreign={foreign}"
+        )
 
 
 class PipelineRunner:
@@ -64,12 +119,145 @@ class PipelineRunner:
         self.run_id = str(run_id or "").strip()
 
     @staticmethod
+    def _normalize_chunk_type(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw == "chunk":
+            return "block"
+        if raw in {"line", "block"}:
+            return raw
+        return raw
+
+    @staticmethod
+    def _parse_bool_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        text = str(value or "").strip().lower()
+        if not text:
+            return False
+        return text in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _resolve_kana_retry_settings(
+        processing_cfg: Dict[str, Any],
+        chunk_options: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, float, int]:
+        chunk_options = (
+            dict(chunk_options) if isinstance(chunk_options, dict) else {}
+        )
+
+        def _pick(*keys: str) -> Any:
+            for container in (chunk_options, processing_cfg):
+                if not isinstance(container, dict):
+                    continue
+                for key in keys:
+                    if key not in container:
+                        continue
+                    value = container.get(key)
+                    if value is None:
+                        continue
+                    if isinstance(value, str) and not value.strip():
+                        continue
+                    return value
+            return None
+
+        enabled_raw = _pick("kana_retry_enabled", "kanaRetryEnabled")
+        enabled = (
+            True
+            if enabled_raw is None
+            else PipelineRunner._parse_bool_flag(enabled_raw)
+        )
+
+        threshold = DEFAULT_KANA_RETRY_THRESHOLD
+        threshold_raw = _pick("kana_retry_threshold", "kanaRetryThreshold")
+        if threshold_raw is not None:
+            try:
+                parsed_threshold = float(threshold_raw)
+                if 0 <= parsed_threshold <= 1:
+                    threshold = parsed_threshold
+            except (TypeError, ValueError):
+                pass
+
+        min_chars = DEFAULT_KANA_RETRY_MIN_CHARS
+        min_chars_raw = _pick("kana_retry_min_chars", "kanaRetryMinChars")
+        if min_chars_raw is not None:
+            try:
+                parsed_min_chars = int(min_chars_raw)
+                if parsed_min_chars >= 1:
+                    min_chars = parsed_min_chars
+            except (TypeError, ValueError):
+                pass
+
+        return enabled, threshold, min_chars
+
+    @staticmethod
+    def _compute_kana_ratio(text: str) -> Tuple[float, int, int]:
+        normalized = str(text or "")
+        effective_chars = len(_KANA_RATIO_BASE_RE.findall(normalized))
+        if effective_chars <= 0:
+            return 0.0, 0, 0
+        kana_chars = len(_KANA_CHAR_RE.findall(normalized))
+        return kana_chars / effective_chars, kana_chars, effective_chars
+
+    @staticmethod
+    def _evaluate_kana_retry(
+        translated: str,
+        *,
+        source_lang: str,
+        chunk_type: str,
+        enabled: bool,
+        threshold: float,
+        min_chars: int,
+    ) -> Dict[str, Any]:
+        ratio, kana_chars, effective_chars = PipelineRunner._compute_kana_ratio(translated)
+        normalized_lang = str(source_lang or "").strip().lower()
+        lang_eligible = normalized_lang in {"ja", "jp"}
+        chunk_eligible = chunk_type == "block"
+        eligible = bool(enabled and lang_eligible and chunk_eligible)
+        should_retry = bool(
+            eligible and effective_chars >= min_chars and ratio >= threshold
+        )
+        return {
+            "should_retry": should_retry,
+            "eligible": eligible,
+            "ratio": ratio,
+            "threshold": threshold,
+            "kanaChars": kana_chars,
+            "effectiveChars": effective_chars,
+            "minChars": min_chars,
+            "sourceLang": normalized_lang,
+            "chunkType": chunk_type,
+        }
+
+    @staticmethod
     def _emit_api_stats_safe(payload: Dict[str, Any]) -> None:
         try:
             emit_api_stats_event(payload)
         except Exception:
             # Stats telemetry should never break the translation flow.
             pass
+
+    @staticmethod
+    def _build_effective_request_payload(request: Any) -> Dict[str, Any]:
+        """Build the final merged request payload close to provider send-time shape."""
+        payload: Dict[str, Any] = {}
+        model = getattr(request, "model", None)
+        messages = getattr(request, "messages", None)
+        if model is not None:
+            payload["model"] = model
+        if messages is not None:
+            payload["messages"] = messages
+        extra = getattr(request, "extra", None)
+        if isinstance(extra, dict):
+            payload.update(extra)
+        temperature = getattr(request, "temperature", None)
+        if temperature is not None:
+            payload["temperature"] = temperature
+        max_tokens = getattr(request, "max_tokens", None)
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        return payload
 
     def _resolve_rules(self, spec: Any) -> List[Dict[str, Any]]:
         if not spec:
@@ -147,6 +335,29 @@ class PipelineRunner:
             except json.JSONDecodeError:
                 return raw
         return ""
+
+    @staticmethod
+    def _extract_relevant_glossary(
+        glossary: Dict[str, str],
+        source_text: str,
+        *,
+        limit: int = 20,
+    ) -> Dict[str, str]:
+        if not glossary or not source_text:
+            return {}
+        matched: Dict[str, str] = {}
+        text = str(source_text or "")
+        for src_term, dst_term in glossary.items():
+            src = str(src_term or "").strip()
+            dst = str(dst_term or "").strip()
+            # 与 V1 保持一致：过滤单字词条，避免误命中。
+            if len(src) <= 1 or not dst:
+                continue
+            if src in text:
+                matched[src] = dst
+                if len(matched) >= max(1, limit):
+                    break
+        return matched
 
     def _extract_source_lines(self, items: List[Dict[str, Any]]) -> List[str]:
         lines: List[str] = []
@@ -274,13 +485,71 @@ class PipelineRunner:
     @staticmethod
     def _resolve_protect_patterns_base(input_path: str) -> Optional[List[str]]:
         lower_input = str(input_path or "").lower()
-        if lower_input.endswith((".srt", ".ass", ".ssa")):
-            from murasaki_translator.core.text_protector import TextProtector
+        if not lower_input.endswith((".txt", ".xlsx")):
+            return None
+        from murasaki_translator.core.text_protector import TextProtector
 
-            return list(TextProtector.SUBTITLE_PATTERNS)
+        return list(TextProtector.DEFAULT_PATTERNS)
+
+    @staticmethod
+    def _should_enable_text_protect_for_file(input_path: str) -> bool:
+        lower_input = str(input_path or "").lower()
+        return lower_input.endswith((".txt", ".xlsx"))
+
+    @staticmethod
+    def _detect_anchor_mode(input_path: str, source_text: str) -> str:
+        normalized = normalize_anchor_stream(source_text)
+        id_tokens = collect_anchor_ids(normalized)
+        if not id_tokens:
+            return ""
+
+        lower_input = str(input_path or "").lower()
         if lower_input.endswith(".epub"):
-            return [r"@id=\d+@", r"@end=\d+@", r"<[^>]+>"]
-        return None
+            return "epub"
+
+        has_end_tokens = bool(
+            re.search(r"@end=\d+@", normalized, flags=re.IGNORECASE)
+        )
+        raw_id_tokens = re.findall(r"@id=(\d+)@", normalized, flags=re.IGNORECASE)
+        has_repeated_ids = len(raw_id_tokens) != len(set(raw_id_tokens))
+        if has_end_tokens or has_repeated_ids:
+            return "alignment"
+        return ""
+
+    @staticmethod
+    def _extract_single_anchor_wrapper(source_text: str) -> Optional[Dict[str, str]]:
+        normalized = normalize_anchor_stream(source_text)
+        match = re.match(
+            r"^\s*@id=(\d+)@\s*([\s\S]*?)\s*@end=\1@\s*$",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        anchor_id = str(match.group(1))
+        inner_text = str(match.group(2) or "").strip("\r\n")
+        return {"id": anchor_id, "inner_text": inner_text}
+
+    @staticmethod
+    def _unwrap_single_anchor_wrapper_body(text: str, anchor_id: str) -> str:
+        normalized = normalize_anchor_stream(str(text or ""))
+        anchor = str(anchor_id or "").strip()
+        if anchor:
+            wrapped_re = re.compile(
+                rf"^\s*@id={re.escape(anchor)}@\s*([\s\S]*?)\s*@end={re.escape(anchor)}@\s*$",
+                flags=re.IGNORECASE,
+            )
+            wrapped_match = wrapped_re.match(normalized)
+            if wrapped_match:
+                return str(wrapped_match.group(1) or "").strip("\r\n")
+
+        # Fallback: strip marker tokens while preserving processed/protected body.
+        return re.sub(
+            r"@(?:id|end)=\d+@",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        ).strip("\r\n ")
 
     @staticmethod
     def _should_use_double_newline_separator(
@@ -545,6 +814,12 @@ class PipelineRunner:
             return {}
         try:
             output_doc = DocumentFactory.get_document(output_path)
+            if hasattr(output_doc, "set_runtime_context"):
+                output_doc.set_runtime_context(
+                    engine_mode="v2",
+                    chunk_type=chunk_type,
+                    document_role="output",
+                )
             self._ensure_line_chunk_keeps_empty(output_doc, chunk_policy)
             output_items = output_doc.load()
             output_blocks = chunk_policy.chunk(output_items)
@@ -638,7 +913,7 @@ class PipelineRunner:
         joiner = str(context_cfg.get("joiner") or "\n")
         if before <= 0 and after <= 0:
             return {"before": "", "after": ""}
-        # block_end 鏍囪瘑鍧楃殑缁撴潫琛岋紙涓嶅惈锛夛紝鐢ㄤ簬鍒嗗潡妯″紡 context
+        # block_end 表示块的结束行（不含），用于分块模式的 context 计算。
         content_end = block_end if block_end is not None else line_index + 1
         start = max(0, line_index - before)
         end = min(len(source_lines), content_end + after)
@@ -758,11 +1033,22 @@ class PipelineRunner:
             else None
         )
         chunk_policy = self.chunk_policies.get_chunk_policy(chunk_policy_ref)
-        chunk_type = str(
-            chunk_policy.profile.get("chunk_type")
-            or chunk_policy.profile.get("type")
-            or ""
+        chunk_type = self._normalize_chunk_type(
+            chunk_policy.profile.get("chunk_type") or ""
         )
+        chunk_options_raw = (
+            chunk_policy.profile.get("options")
+            if isinstance(getattr(chunk_policy, "profile", None), dict)
+            else {}
+        )
+        chunk_options = (
+            dict(chunk_options_raw)
+            if isinstance(chunk_options_raw, dict)
+            else {}
+        )
+        if chunk_type not in {"line", "block"}:
+            # Keep behavior predictable for unknown values.
+            chunk_type = "block"
         output_path = self._resolve_output_path(
             input_path,
             output_path,
@@ -790,6 +1076,13 @@ class PipelineRunner:
         _failed_line_lock = threading.Lock()
 
         doc = DocumentFactory.get_document(input_path)
+        if hasattr(doc, "set_runtime_context"):
+            doc.set_runtime_context(
+                engine_mode="v2",
+                chunk_type=chunk_type,
+                source_format=source_format,
+                document_role="input",
+            )
         self._ensure_line_chunk_keeps_empty(doc, chunk_policy)
         items = doc.load()
         source_lines = self._extract_source_lines(items)
@@ -813,6 +1106,7 @@ class PipelineRunner:
         if glossary_spec is None:
             glossary_spec = pipeline.get("glossary")
         glossary_text = self._load_glossary(glossary_spec)
+        glossary_dict_for_prompt = v2_processing.load_glossary(glossary_spec)
         resolved_cache_dir = (
             cache_dir if cache_dir and os.path.isdir(cache_dir) else None
         )
@@ -899,9 +1193,22 @@ class PipelineRunner:
             rules_post_spec = pipeline.get("rules_post")
         if rules_pre_spec or rules_post_spec:
             processing_enabled = True
-        source_lang = (
-            str(processing_cfg.get("source_lang") or "ja").strip() or "ja"
+        source_lang_raw = processing_cfg.get("source_lang")
+        source_lang = str(source_lang_raw or "ja").strip() or "ja"
+        kana_retry_source_lang_raw = (
+            chunk_options.get("kana_retry_source_lang")
+            if chunk_options.get("kana_retry_source_lang") is not None
+            else chunk_options.get("kanaRetrySourceLang")
         )
+        if kana_retry_source_lang_raw is None:
+            kana_retry_source_lang_raw = (
+                chunk_options.get("source_lang")
+                if chunk_options.get("source_lang") is not None
+                else chunk_options.get("sourceLang")
+            )
+        if kana_retry_source_lang_raw is None:
+            kana_retry_source_lang_raw = source_lang_raw
+        kana_retry_source_lang = str(kana_retry_source_lang_raw or "").strip()
         # 默认关闭质量检查，需要在 Pipeline YAML processing.enable_quality
         # 或 CLI --enable-quality 中显式启用。
         enable_quality = processing_cfg.get("enable_quality")
@@ -912,14 +1219,26 @@ class PipelineRunner:
         enable_text_protect = processing_cfg.get("text_protect")
         if enable_text_protect is None:
             enable_text_protect = False
+        enable_text_protect = bool(enable_text_protect)
+        if enable_text_protect:
+            enable_text_protect = self._should_enable_text_protect_for_file(input_path)
         strict_line_count = bool(processing_cfg.get("strict_line_count"))
+        (
+            kana_retry_enabled,
+            kana_retry_threshold,
+            kana_retry_min_chars,
+        ) = self._resolve_kana_retry_settings(processing_cfg, chunk_options)
 
         if processing_enabled:
             pre_rules = self._resolve_rules(rules_pre_spec)
             post_rules = self._resolve_rules(rules_post_spec)
             post_rules = self._sanitize_post_rules_for_input(post_rules, input_path)
-            protect_patterns_base = self._resolve_protect_patterns_base(input_path)
-            glossary_dict = v2_processing.load_glossary(glossary_spec)
+            protect_patterns_base = (
+                self._resolve_protect_patterns_base(input_path)
+                if enable_text_protect
+                else None
+            )
+            glossary_dict = glossary_dict_for_prompt
             if (
                 pre_rules
                 or post_rules
@@ -966,15 +1285,50 @@ class PipelineRunner:
             "chunk_type": chunk_type,
             "config_hash": fingerprint.get("config_hash"),
         }
+        expected_fingerprint_relaxed = {
+            "input": input_path,
+            "pipeline": pipeline_id,
+            "chunk_type": chunk_type,
+        }
         temp_resume_exists = os.path.exists(temp_progress_path)
+        resume_from_temp = False
         if resume:
-            resume_entries, resume_matched = self._load_resume_file(
-                temp_progress_path, expected=expected_fingerprint
-            )
-            if not resume_entries and not temp_resume_exists:
+            if temp_resume_exists:
+                resume_entries, resume_matched = self._load_resume_file(
+                    temp_progress_path, expected=expected_fingerprint
+                )
+                if resume_entries:
+                    resume_from_temp = True
+                else:
+                    relaxed_entries, _ = self._load_resume_file(
+                        temp_progress_path, expected=expected_fingerprint_relaxed
+                    )
+                    if relaxed_entries:
+                        resume_entries = relaxed_entries
+                        resume_matched = False
+                        resume_from_temp = True
+                        emit_warning(
+                            0,
+                            "resume_fingerprint_mismatch_soft_resume",
+                            "quality",
+                        )
+                    else:
+                        emit_warning(
+                            0,
+                            "resume_fingerprint_mismatch_skip_temp",
+                            "quality",
+                        )
+
+            if not resume_entries:
                 resume_entries = self._load_resume_cache(output_path, cache_dir)
                 resume_matched = False
-            if not resume_entries and not temp_resume_exists:
+                if resume_entries:
+                    emit_warning(
+                        0,
+                        "resume_from_cache_fallback",
+                        "quality",
+                    )
+            if not resume_entries:
                 resume_entries = self._load_resume_output(
                     output_path,
                     blocks,
@@ -985,12 +1339,12 @@ class PipelineRunner:
                     ),
                 )
                 resume_matched = False
-            if temp_resume_exists and not resume_matched:
-                emit_warning(
-                    0,
-                    "resume_fingerprint_mismatch_skip_cache",
-                    "quality",
-                )
+                if resume_entries:
+                    emit_warning(
+                        0,
+                        "resume_from_output_fallback",
+                        "quality",
+                    )
 
         prompt_source_lines = source_lines
         if (
@@ -1002,11 +1356,15 @@ class PipelineRunner:
                 processing_processor.apply_pre(line) for line in source_lines
             ]
 
-        # --- Dashboard 鏃ュ織鍗忚 ---
+        # --- Dashboard 日志协议 ---
         temp_progress_file = None
         temp_lock = threading.Lock()
         try:
-            temp_mode = "a" if resume and resume_entries and resume_matched else "w"
+            temp_mode = (
+                "a"
+                if resume and resume_entries and resume_from_temp and resume_matched
+                else "w"
+            )
             temp_progress_file = open(
                 temp_progress_path, temp_mode, encoding="utf-8", buffering=1
             )
@@ -1014,6 +1372,21 @@ class PipelineRunner:
                 temp_progress_file.write(
                     json.dumps(fingerprint, ensure_ascii=False) + "\n"
                 )
+                if resume and resume_entries:
+                    for resume_idx in sorted(resume_entries.keys()):
+                        entry = resume_entries.get(resume_idx) or {}
+                        temp_progress_file.write(
+                            json.dumps(
+                                {
+                                    "type": "block",
+                                    "index": int(resume_idx),
+                                    "src": str(entry.get("src") or ""),
+                                    "dst": str(entry.get("dst") or ""),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
                 temp_progress_file.flush()
         except Exception:
             temp_progress_file = None
@@ -1139,15 +1512,24 @@ class PipelineRunner:
                         line_index = meta
                         break
                         
-            # 瀵逛簬鍧楁ā寮忔垨缂哄け鐪熷疄琛屽彿鐨勭粨鏋勫寲妯″紡锛屾垜浠笉鑳戒吉閫?line_index
+            # 分块模式或缺少真实行号时，不能伪造 line_index。
             fallback_index = line_index if line_index is not None else idx
                 
             # 分块模式的 context 以整块行范围为准，而不是仅使用首行。
             blk_start, blk_end = self._block_line_range(block)
             if blk_start == 0 and blk_end == 0:
                 blk_start, blk_end = fallback_index, fallback_index + 1
+            block_line_ids = sorted(
+                {
+                    meta
+                    for meta in (block.metadata or [])
+                    if isinstance(meta, int)
+                }
+            )
             context_before = ""
             context_after = ""
+            context_anchor: Optional[int] = None
+            context_block_end: Optional[int] = None
             target_line_ids: List[int] = []
             active_source_lines = prompt_source_lines if prompt_source_lines else source_lines
             if active_source_lines:
@@ -1158,6 +1540,7 @@ class PipelineRunner:
                 )
                 safe_block_end = blk_end if blk_end > context_anchor else context_anchor + 1
                 safe_block_end = min(len(active_source_lines), safe_block_end)
+                context_block_end = safe_block_end
                 context = self._build_context(
                     active_source_lines,
                     context_anchor,
@@ -1168,6 +1551,7 @@ class PipelineRunner:
                 context_after = context["after"]
 
             source_text = block.prompt_text
+            raw_source_text = str(getattr(block, "prompt_text", "") or "")
             source_format = str(context_cfg.get("source_format") or "").strip().lower()
             use_jsonl = source_format == "jsonl" and chunk_type == "line"
             if not use_jsonl and processing_processor:
@@ -1214,12 +1598,58 @@ class PipelineRunner:
                 )
                 source_text = self._build_jsonl_range(protected_lines, start, end)
 
+            anchor_mode = ""
+            anchor_local_ctx = None
+            anchor_line_wrapper: Optional[Dict[str, str]] = None
+            anchor_source_for_check = normalize_anchor_stream(raw_source_text)
+            if chunk_type == "line" and not use_jsonl:
+                wrapper = self._extract_single_anchor_wrapper(raw_source_text)
+                if wrapper is not None:
+                    anchor_line_wrapper = wrapper
+                    source_text = self._unwrap_single_anchor_wrapper_body(
+                        source_text,
+                        str(wrapper.get("id") or ""),
+                    )
+            if not use_jsonl and anchor_line_wrapper is None:
+                anchor_mode = self._detect_anchor_mode(input_path, raw_source_text)
+                if anchor_mode:
+                    candidate_ctx = prepare_local_anchor_context(
+                        raw_source_text,
+                        source_text,
+                        mode=anchor_mode,
+                    )
+                    if candidate_ctx.enabled:
+                        anchor_local_ctx = candidate_ctx
+                        source_text = candidate_ctx.prompt_text_local
+                        anchor_source_for_check = candidate_ctx.source_text_local
+
+            effective_glossary_text = glossary_text
+            glossary_total_count = len(glossary_dict_for_prompt)
+            matched_glossary_terms: List[str] = []
+            if glossary_dict_for_prompt:
+                source_for_glossary = (
+                    str(anchor_line_wrapper.get("inner_text") or "")
+                    if anchor_line_wrapper is not None
+                    else str(getattr(block, "prompt_text", "") or source_text or "")
+                )
+                matched_glossary = self._extract_relevant_glossary(
+                    glossary_dict_for_prompt,
+                    source_for_glossary,
+                    limit=20,
+                )
+                matched_glossary_terms = list(matched_glossary.keys())
+                effective_glossary_text = (
+                    self._format_glossary_text(matched_glossary)
+                    if matched_glossary
+                    else ""
+                )
+
             messages = build_messages(
                 prompt_profile,
                 source_text=source_text,
                 context_before=context_before,
                 context_after=context_after,
-                glossary_text=glossary_text,
+                glossary_text=effective_glossary_text,
                 line_index=line_index,
             )
 
@@ -1287,15 +1717,61 @@ class PipelineRunner:
                 current_endpoint_label: Optional[str] = None
                 current_model: Optional[str] = None
                 current_request_payload: Dict[str, Any] = {}
+                current_request_payload_effective: Dict[str, Any] = {}
                 current_request_headers: Dict[str, str] | None = None
                 current_request_url: Optional[str] = None
                 attempt_no = attempt + 1
+                chunk_target_chars: Optional[int] = None
+                chunk_max_chars: Optional[int] = None
+                try:
+                    if chunk_options.get("target_chars") is not None:
+                        chunk_target_chars = int(chunk_options.get("target_chars"))
+                    if chunk_options.get("max_chars") is not None:
+                        chunk_max_chars = int(chunk_options.get("max_chars"))
+                except (TypeError, ValueError):
+                    pass
+                effective_target_line_ids = (
+                    target_line_ids if target_line_ids else block_line_ids
+                )
+                line_policy_enabled = bool(line_policy and apply_line_policy)
+                line_policy_eligible = bool(
+                    line_policy_enabled
+                    and line_index is not None
+                    and line_index < len(source_lines)
+                )
+                kana_retry_eligible = bool(
+                    kana_retry_enabled
+                    and chunk_type == "block"
+                    and str(kana_retry_source_lang or "").strip().lower()
+                    in {"ja", "jp"}
+                )
                 common_event_meta = {
                     "blockIndex": idx,
                     "lineIndex": line_index,
+                    "blockLineStart": blk_start,
+                    "blockLineEnd": blk_end,
+                    "blockLineIds": block_line_ids,
+                    "targetLineIds": effective_target_line_ids,
                     "chunkType": chunk_type,
                     "sourceFormat": source_format or "plain",
+                    "useJsonl": use_jsonl,
                     "parserType": parser_type or "",
+                    "parserRef": parser_ref or "",
+                    "linePolicyRef": line_policy_ref or "",
+                    "linePolicyEnabled": line_policy_enabled,
+                    "linePolicyEligible": line_policy_eligible,
+                    "kanaRetryEnabled": kana_retry_eligible,
+                    "kanaRetryThreshold": kana_retry_threshold,
+                    "kanaRetryMinChars": kana_retry_min_chars,
+                    "contextAnchor": context_anchor,
+                    "contextBlockEnd": context_block_end,
+                    "contextBeforeChars": len(context_before),
+                    "contextAfterChars": len(context_after),
+                    "glossaryTotalCount": glossary_total_count,
+                    "glossaryMatchedCount": len(matched_glossary_terms),
+                    "glossaryMatchedTerms": matched_glossary_terms,
+                    "chunkTargetChars": chunk_target_chars,
+                    "chunkMaxChars": chunk_max_chars,
                     "providerRef": provider_ref,
                     "providerType": str(
                         provider.profile.get("type")
@@ -1347,6 +1823,11 @@ class PipelineRunner:
                         "max_tokens": getattr(request, "max_tokens", None),
                         "extra": getattr(request, "extra", None),
                     }
+                    current_request_payload_effective = (
+                        self._build_effective_request_payload(request)
+                    )
+                    if not current_request_payload_effective:
+                        current_request_payload_effective = dict(current_request_payload)
                     request_headers_raw = getattr(request, "headers", None)
                     current_request_headers = (
                         {str(k): str(v) for k, v in request_headers_raw.items()}
@@ -1451,7 +1932,78 @@ class PipelineRunner:
                         or str(raw_request.get("url") or "").strip()
                         or current_request_url
                     )
+                    request_payload_for_event = current_request_payload
+                    raw_request_payload = raw_request.get("payload")
+                    if isinstance(raw_request_payload, dict):
+                        request_payload_for_event = raw_request_payload
                     response_payload = raw_data if raw_data is not None else response.raw
+                    raw_choices = (
+                        raw_data.get("choices")
+                        if isinstance(raw_data, dict)
+                        else []
+                    )
+                    first_choice = (
+                        raw_choices[0]
+                        if isinstance(raw_choices, list)
+                        and raw_choices
+                        and isinstance(raw_choices[0], dict)
+                        else {}
+                    )
+                    provider_raw_meta = {
+                        "requestUrl": raw_request.get("url"),
+                        "responseStatus": raw_response.get("status_code"),
+                        "responseHeaders": (
+                            raw_response.get("headers")
+                            if isinstance(raw_response.get("headers"), dict)
+                            else None
+                        ),
+                    }
+                    provider_raw_meta = {
+                        key: value
+                        for key, value in provider_raw_meta.items()
+                        if value not in (None, "", {}, [])
+                    }
+                    response_meta = {
+                        "responseId": (
+                            str(raw_data.get("id")).strip()
+                            if isinstance(raw_data, dict) and raw_data.get("id") is not None
+                            else None
+                        ),
+                        "responseModel": (
+                            str(raw_data.get("model")).strip()
+                            if isinstance(raw_data, dict) and raw_data.get("model") is not None
+                            else current_model
+                        ),
+                        "responseCreated": (
+                            raw_data.get("created")
+                            if isinstance(raw_data, dict)
+                            else None
+                        ),
+                        "finishReason": (
+                            str(first_choice.get("finish_reason")).strip()
+                            if first_choice.get("finish_reason") is not None
+                            else None
+                        ),
+                        "choiceCount": len(raw_choices) if isinstance(raw_choices, list) else None,
+                        "systemFingerprint": (
+                            str(raw_data.get("system_fingerprint")).strip()
+                            if isinstance(raw_data, dict)
+                            and raw_data.get("system_fingerprint") is not None
+                            else None
+                        ),
+                        "usage": _usage if isinstance(_usage, dict) else None,
+                        "responseParseMode": (
+                            "jsonl"
+                            if use_jsonl and bool(target_line_ids)
+                            else parser_type or "parser"
+                        ),
+                        "providerRawMeta": provider_raw_meta or None,
+                    }
+                    response_meta = {
+                        key: value
+                        for key, value in response_meta.items()
+                        if value not in (None, "", {}, [])
+                    }
 
                     self._emit_api_stats_safe(
                         {
@@ -1471,7 +2023,7 @@ class PipelineRunner:
                             "durationMs": _ping_ms,
                             "inputTokens": _input_tokens,
                             "outputTokens": _output_tokens,
-                            "requestPayload": current_request_payload,
+                            "requestPayload": request_payload_for_event,
                             "responsePayload": response_payload,
                             "requestHeaders": request_headers_for_event,
                             "responseHeaders": response_headers_for_event,
@@ -1480,6 +2032,7 @@ class PipelineRunner:
                                 **current_request_meta,
                                 "attempt": attempt_no,
                                 "providerId": getattr(request, "provider_id", None),
+                                **response_meta,
                             },
                         }
                     )
@@ -1519,6 +2072,49 @@ class PipelineRunner:
                                 "LinePolicy: unexpected line count"
                             )
                         translated = checked[0]
+                    if anchor_mode:
+                        repaired_text, repaired_ok, anchor_meta = (
+                            repair_and_validate_anchor_output(
+                                anchor_source_for_check,
+                                translated,
+                                mode=anchor_mode,
+                            )
+                        )
+                        if not repaired_ok:
+                            raise AnchorIntegrityRetryError(meta=anchor_meta)
+                        translated = repaired_text
+                        if anchor_local_ctx and anchor_local_ctx.enabled:
+                            translated = restore_output_anchors(
+                                translated,
+                                anchor_local_ctx.local_to_global,
+                            )
+                    if anchor_line_wrapper is not None:
+                        anchor_id = str(anchor_line_wrapper.get("id") or "").strip()
+                        translated_body = re.sub(
+                            r"@(?:id|end)=\d+@",
+                            "",
+                            str(translated or ""),
+                            flags=re.IGNORECASE,
+                        ).strip("\r\n ")
+                        translated = (
+                            f"@id={anchor_id}@\n{translated_body}\n@end={anchor_id}@"
+                        )
+                    kana_retry_check = self._evaluate_kana_retry(
+                        translated,
+                        source_lang=kana_retry_source_lang,
+                        chunk_type=chunk_type,
+                        enabled=kana_retry_enabled,
+                        threshold=kana_retry_threshold,
+                        min_chars=kana_retry_min_chars,
+                    )
+                    if kana_retry_check["should_retry"]:
+                        raise KanaResidueRetryError(
+                            ratio=float(kana_retry_check["ratio"]),
+                            threshold=float(kana_retry_check["threshold"]),
+                            kana_chars=int(kana_retry_check["kanaChars"]),
+                            effective_chars=int(kana_retry_check["effectiveChars"]),
+                            min_chars=int(kana_retry_check["minChars"]),
+                        )
                     write_temp_entry(idx, block.prompt_text, translated)
                     return idx, TextBlock(
                         id=idx + 1,
@@ -1527,18 +2123,37 @@ class PipelineRunner:
                     )
                 except PipelineStopRequested:
                     raise
-                except (ProviderError, ParserError, LinePolicyError) as exc:
+                except (
+                    ProviderError,
+                    ParserError,
+                    LinePolicyError,
+                    KanaResidueRetryError,
+                    AnchorIntegrityRetryError,
+                ) as exc:
                     last_error = str(exc)
                     if adaptive is not None and isinstance(exc, ProviderError):
                         adaptive.note_error(last_error)
                     error_type = (
-                        "line_mismatch" if isinstance(exc, LinePolicyError)
+                        "anchor_missing" if isinstance(exc, AnchorIntegrityRetryError)
+                        else "kana_residue" if isinstance(exc, KanaResidueRetryError)
+                        else "line_mismatch" if isinstance(exc, LinePolicyError)
                         else "empty" if isinstance(exc, ParserError)
                         else "provider_error"
                     )
                     _status_code = None
                     _duration_ms: Optional[int] = None
                     _provider_error_type = error_type
+                    _retry_extra_meta: Dict[str, Any] = {}
+                    if isinstance(exc, AnchorIntegrityRetryError):
+                        _retry_extra_meta = dict(exc.meta or {})
+                    if isinstance(exc, KanaResidueRetryError):
+                        _retry_extra_meta = {
+                            "kanaRetryRatio": round(exc.ratio, 6),
+                            "kanaRetryThreshold": exc.threshold,
+                            "kanaRetryMinChars": exc.min_chars,
+                            "kanaChars": exc.kana_chars,
+                            "kanaEffectiveChars": exc.effective_chars,
+                        }
                     if isinstance(exc, ProviderError):
                         _status_code = exc.status_code
                         _duration_ms = exc.duration_ms
@@ -1549,6 +2164,24 @@ class PipelineRunner:
                             _m = _re.search(r"HTTP (\d{3})", str(exc))
                             if _m:
                                 _status_code = int(_m.group(1))
+
+                        error_response_payload: Dict[str, Any] = {}
+                        if exc.response_text is not None:
+                            error_response_payload["responseText"] = exc.response_text
+                        if _status_code is not None:
+                            error_response_payload["statusCode"] = _status_code
+                        if isinstance(exc.response_headers, dict) and exc.response_headers:
+                            error_response_payload["responseHeaders"] = exc.response_headers
+                        request_headers_for_error = (
+                            exc.request_headers
+                            if isinstance(exc.request_headers, dict)
+                            else current_request_headers
+                        )
+                        response_headers_for_error = (
+                            exc.response_headers
+                            if isinstance(exc.response_headers, dict)
+                            else None
+                        )
 
                         self._emit_api_stats_safe(
                             {
@@ -1568,12 +2201,19 @@ class PipelineRunner:
                                 "durationMs": _duration_ms,
                                 "errorType": _provider_error_type,
                                 "errorMessage": str(exc),
-                                "requestPayload": current_request_payload,
-                                "requestHeaders": current_request_headers,
+                                "requestPayload": current_request_payload_effective,
+                                "responsePayload": error_response_payload or None,
+                                "requestHeaders": request_headers_for_error,
+                                "responseHeaders": response_headers_for_error,
                                 "meta": {
                                     **common_event_meta,
                                     **current_request_meta,
                                     "attempt": attempt_no,
+                                    "providerErrorRequestId": exc.request_id,
+                                    "providerErrorUrl": exc.url,
+                                    "providerErrorStatusCode": exc.status_code,
+                                    "providerErrorDurationMs": exc.duration_ms,
+                                    "providerErrorResponseHeaders": response_headers_for_error,
                                 },
                             }
                         )
@@ -1605,6 +2245,7 @@ class PipelineRunner:
                                     **common_event_meta,
                                     **current_request_meta,
                                     "attempt": attempt_no,
+                                    **_retry_extra_meta,
                                 },
                             }
                         )
@@ -1644,7 +2285,18 @@ class PipelineRunner:
         except (TypeError, ValueError):
             concurrency = 1
 
-        if concurrency == 0:
+        strict_concurrency = (
+            self._parse_bool_flag(settings.get("strict_concurrency"))
+            or self._parse_bool_flag(provider.profile.get("strict_concurrency"))
+        )
+
+        if strict_concurrency:
+            # Strict mode means fixed in-flight concurrency (no adaptive scaling).
+            if concurrency <= 0:
+                concurrency = 1
+            concurrency = max(1, min(concurrency, MAX_CONCURRENCY))
+            adaptive = None
+        elif concurrency == 0:
             adaptive = AdaptiveConcurrency(max_limit=max(1, min(len(blocks), 128)))
         else:
             concurrency = max(1, min(concurrency, MAX_CONCURRENCY))
@@ -1794,7 +2446,7 @@ class PipelineRunner:
             interrupted_separator = (
                 "\n\n"
                 if (
-                    chunk_type == "chunk"
+                    chunk_type == "block"
                     or self._should_use_double_newline_separator(post_rules)
                 )
                 else "\n"
@@ -1866,7 +2518,7 @@ class PipelineRunner:
             separator = (
                 "\n\n"
                 if (
-                    chunk_type == "chunk"
+                    chunk_type == "block"
                     or self._should_use_double_newline_separator(post_rules)
                 )
                 else "\n"

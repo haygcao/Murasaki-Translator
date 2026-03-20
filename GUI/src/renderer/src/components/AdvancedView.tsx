@@ -17,6 +17,7 @@ import {
   Input,
   Label,
 } from "./ui/core";
+import { Select } from "./ui/Select";
 import { translations, Language } from "../lib/i18n";
 import { AlertModal } from "./ui/AlertModal";
 import { useAlertModal } from "../hooks/useAlertModal";
@@ -65,11 +66,11 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
   // Text Processing State
 
   // Quality Control Settings (高级质量控制)
-  const [temperature, setTemperature] = useState(0.7);
+  const [temperature, setTemperature] = useState(0.3);
   const [enableLineCheck, setEnableLineCheck] = useState(true);
   const [lineToleranceAbs, setLineToleranceAbs] = useState(10);
   const [lineTolerancePct, setLineTolerancePct] = useState(20);
-  const [enableAnchorCheck, setEnableAnchorCheck] = useState(true);
+  const [enableAnchorCheck, setEnableAnchorCheck] = useState(false);
   const [anchorCheckRetries, setAnchorCheckRetries] = useState(1);
   const [enableRepPenaltyRetry, setEnableRepPenaltyRetry] = useState(true);
   const [repPenaltyBase, setRepPenaltyBase] = useState(1.0);
@@ -134,7 +135,7 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
     const savedLinePct = localStorage.getItem("config_line_tolerance_pct");
     if (savedLinePct) setLineTolerancePct(parseInt(savedLinePct));
     setEnableAnchorCheck(
-      localStorage.getItem("config_anchor_check") !== "false",
+      localStorage.getItem("config_anchor_check") === "true",
     );
     const savedAnchorRetries = localStorage.getItem(
       "config_anchor_check_retries",
@@ -224,7 +225,7 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
   const loadHardwareSpecs = async () => {
     setLoadingSpecs(true);
     try {
-      // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
       const s = await window.api.getHardwareSpecs();
       console.log("Specs:", s);
       if (s) {
@@ -242,7 +243,7 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
 
   const loadModelInfo = async (modelName: string) => {
     try {
-      // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
       const info = await window.api.getModelInfo(modelName);
       if (info) {
         console.log("Model Info:", info);
@@ -358,7 +359,7 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
                       <label className="text-xs font-medium text-muted-foreground">
                         {t.config.device.mode}
                       </label>
-                      <select
+                      <Select
                         className="w-full border border-border p-2 rounded bg-secondary text-foreground text-sm"
                         value={deviceMode}
                         onChange={(e) =>
@@ -369,7 +370,7 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
                           {t.config.device.modes.auto}
                         </option>
                         <option value="cpu">{t.config.device.modes.cpu}</option>
-                      </select>
+                      </Select>
                       {deviceMode === "cpu" && (
                         <p className="text-xs text-amber-600">
                           {av.cpuWarning}
@@ -399,7 +400,7 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
                           <label className="text-xs font-medium text-muted-foreground">
                             {t.config.gpuLayers}
                           </label>
-                          <select
+                          <Select
                             className="w-full border border-border p-2 rounded bg-secondary text-foreground text-sm"
                             value={gpuLayers}
                             onChange={(e) => setGpuLayers(e.target.value)}
@@ -411,7 +412,7 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
                             <option value="32">32</option>
                             <option value="48">48</option>
                             <option value="64">64</option>
-                          </select>
+                          </Select>
                           <p className="text-xs text-muted-foreground">
                             {av.gpuLayersDesc}
                           </p>
@@ -1611,7 +1612,7 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
                         <label className="text-xs text-muted-foreground flex items-center justify-between font-medium">
                           <span>{av.strictModeLabel}</span>
                         </label>
-                        <select
+                        <Select
                           className="w-full border border-border p-1.5 rounded bg-secondary text-foreground text-xs"
                           value={strictMode}
                           onChange={(e) => setStrictMode(e.target.value)}
@@ -1619,7 +1620,7 @@ export function AdvancedView({ lang, remoteRuntime }: AdvancedViewProps) {
                           <option value="off">{av.strictModeOff}</option>
                           <option value="subs">{av.strictModeSubs}</option>
                           <option value="all">{av.strictModeAll}</option>
-                        </select>
+                        </Select>
                         <p className="text-[10px] text-muted-foreground italic leading-relaxed">
                           {strictMode === "off" ? (
                             av.strictModeOffDesc

@@ -1,2 +1,6 @@
+-r requirements.txt
+-r server/requirements.txt
+
 pytest>=7.4.0
 pytest-asyncio>=0.23.5
+mypy>=1.19.1

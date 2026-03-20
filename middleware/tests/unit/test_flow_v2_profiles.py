@@ -56,6 +56,24 @@ def test_profile_store_list_chunk_type(tmp_path):
 
 
 @pytest.mark.unit
+def test_profile_store_normalizes_current_strict_concurrency(tmp_path):
+    api_dir = tmp_path / "api"
+    api_dir.mkdir()
+    profile_path = api_dir / "api_current.yaml"
+    profile_path.write_text(
+        "id: api_current\nname: Current API\ntype: openai_compat\nstrict_concurrency: 'true'\n",
+        encoding="utf-8",
+    )
+    store = ProfileStore(str(tmp_path))
+    profile = store.load_profile("api", "api_current")
+
+    assert profile.get("strict_concurrency") is True
+
+    persisted = yaml.safe_load(profile_path.read_text(encoding="utf-8")) or {}
+    assert persisted.get("strict_concurrency") is True
+
+
+@pytest.mark.unit
 def test_default_line_tolerant_profile_checks_enabled():
     profile_path = (
         Path(__file__).resolve().parents[2]

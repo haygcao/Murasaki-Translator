@@ -32,6 +32,7 @@ import {
   Bot,
 } from "lucide-react";
 import { Button, Card, Tooltip as UITooltip } from "./ui/core";
+import { Select } from "./ui/Select";
 import { translations, Language } from "../lib/i18n";
 import { getVariants } from "../lib/utils";
 import { identifyModel } from "../lib/modelConfig";
@@ -61,6 +62,11 @@ import {
   generateId,
   getFileType,
 } from "../types/common";
+import {
+  loadLibraryQueueWithLegacyMigration,
+  persistLibraryQueue,
+} from "../lib/libraryQueueStorage";
+import { extractElectronDragPaths } from "../lib/dragDropPaths";
 import type { ProcessExitPayload } from "../types/api";
 import { FileConfigModal } from "./LibraryView";
 import { stripSystemMarkersForDisplay } from "../lib/displayText";
@@ -81,6 +87,14 @@ import {
   applyRetryEventToV2HistoryStats,
   createEmptyV2HistoryStats,
 } from "../lib/v2HistoryStats";
+import {
+  createV2SpeedSmoothingState,
+  smoothV2SpeedMetrics,
+} from "../lib/v2SpeedMetrics";
+import {
+  resolveProviderMonitorApiKey,
+  resolveProviderMonitorUrl,
+} from "../lib/apiMonitorProvider";
 
 // Window.api type is defined in src/types/api.d.ts
 
@@ -105,40 +119,27 @@ interface GlossaryOption {
 
 const AUTO_START_QUEUE_KEY = "murasaki_auto_start_queue";
 const CONFIG_SYNC_KEY = "murasaki_pending_config_sync";
+const isRetryableQueueStatus = (status: QueueItem["status"]) =>
+  status === "failed" || status === "interrupted";
 
 export const Dashboard = forwardRef<any, DashboardProps>(
   ({ lang, active, onRunningChange, remoteRuntime }, ref) => {
     const t = translations[lang];
+    const topBarSelectClass =
+      "w-full h-8 border border-border/30 bg-background/45 text-sm font-medium text-foreground shadow-none hover:bg-background/55 focus-visible:ring-1 focus-visible:ring-border/50";
 
     // Queue System (Synced with LibraryView)
-    const [queue, setQueue] = useState<QueueItem[]>(() => {
-      try {
-        const saved = localStorage.getItem("library_queue");
-        if (saved) return JSON.parse(saved);
-      } catch (e) {
-        console.error("Failed to load queue:", e);
-      }
-
-      // Legacy fallback
-      try {
-        const legacy = localStorage.getItem("file_queue");
-        if (legacy) {
-          const paths = JSON.parse(legacy) as string[];
-          return paths.map((path) => ({
-            id: generateId(),
-            path,
-            fileName: path.split(/[/\\]/).pop() || path,
-            fileType: getFileType(path),
-            addedAt: new Date().toISOString(),
-            config: { useGlobalDefaults: true },
-            status: "pending" as const,
-          })) as QueueItem[];
-        }
-      } catch (e) {
-        // Ignore legacy queue parse failure and continue with empty queue.
-      }
-      return [];
-    });
+    const [queue, setQueue] = useState<QueueItem[]>(() =>
+      loadLibraryQueueWithLegacyMigration((path) => ({
+        id: generateId(),
+        path,
+        fileName: path.split(/[/\\]/).pop() || path,
+        fileType: getFileType(path),
+        addedAt: new Date().toISOString(),
+        config: { useGlobalDefaults: true },
+        status: "pending" as const,
+      })),
+    );
 
     // Sync verification on active
     useEffect(() => {
@@ -164,11 +165,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
 
     // Persistence
     useEffect(() => {
-      localStorage.setItem("library_queue", JSON.stringify(queue));
-      localStorage.setItem(
-        "file_queue",
-        JSON.stringify(queue.map((q) => q.path)),
-      );
+      persistLibraryQueue(queue);
     }, [queue]);
 
     const [currentQueueIndex, setCurrentQueueIndex] = useState(-1);
@@ -213,7 +210,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
     const [monitorData, setMonitorData] = useState<MonitorData | null>(null);
     const [apiMonitorData, setApiMonitorData] = useState<ApiMonitorData>({
       url: "",
-      ping: null,
+      latencyMs: null,
       rpm: 0,
       concurrency: 0,
     });
@@ -223,18 +220,8 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       () => (localStorage.getItem("config_engine_mode") as "v1" | "v2") || "v1",
     );
     const [v2PipelineId, setV2PipelineId] = useState<string>(() => {
-      // 优先读 Dashboard 自己的存储，再 fallback 到 ApiManager 的选择
       const dashboardVal = localStorage.getItem("config_v2_pipeline_id");
-      if (dashboardVal) return dashboardVal;
-      try {
-        const apiMgrVal = localStorage.getItem(
-          "murasaki.v2.active_pipeline_id",
-        );
-        if (apiMgrVal) return JSON.parse(apiMgrVal) as string;
-      } catch {
-        /* ignore */
-      }
-      return "";
+      return dashboardVal || "";
     });
     const [v2Profiles, setV2Profiles] = useState<
       Array<{
@@ -270,20 +257,10 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                 chunkType: normalizeChunkType(p.chunk_type ?? p.chunkType),
               })),
             );
-            // 如果当前没选择但ApiManager有选择，自动同步
             if (!v2PipelineId && profiles.length > 0) {
-              try {
-                const apiMgrVal = localStorage.getItem(
-                  "murasaki.v2.active_pipeline_id",
-                );
-                if (apiMgrVal) {
-                  const parsed = JSON.parse(apiMgrVal) as string;
-                  if (profiles.some((p: any) => p.id === parsed)) {
-                    setV2PipelineId(parsed);
-                  }
-                }
-              } catch {
-                /* ignore */
+              const currentId = localStorage.getItem("config_v2_pipeline_id");
+              if (currentId && profiles.some((p: any) => p.id === currentId)) {
+                setV2PipelineId(currentId);
               }
             }
           }
@@ -299,7 +276,45 @@ export const Dashboard = forwardRef<any, DashboardProps>(
     }, [isRunning, onRunningChange]);
 
     useEffect(() => {
-      if (engineMode !== "v2" || !v2PipelineId || !active) return;
+      const handleQueueUpdated = () => {
+        if (isRunning) return;
+        try {
+          const saved = localStorage.getItem("library_queue");
+          if (!saved) return;
+          const loaded = JSON.parse(saved);
+          if (!Array.isArray(loaded)) return;
+          setQueue(loaded);
+          const completed = new Set<string>();
+          loaded.forEach((item: QueueItem) => {
+            if (item.status === "completed") completed.add(item.path);
+          });
+          setCompletedFiles(completed);
+        } catch {
+          // ignore malformed queue payload
+        }
+      };
+      window.addEventListener(
+        "murasaki:library-queue-updated",
+        handleQueueUpdated as EventListener,
+      );
+      return () => {
+        window.removeEventListener(
+          "murasaki:library-queue-updated",
+          handleQueueUpdated as EventListener,
+        );
+      };
+    }, [isRunning]);
+
+    useEffect(() => {
+      if (engineMode !== "v2" || !v2PipelineId || !active) {
+        setApiMonitorData((prev) => ({
+          ...prev,
+          url: "",
+          latencyMs: null,
+          concurrency: 0,
+        }));
+        return;
+      }
 
       let isSubscribed = true;
       const loadProviderInfo = async (probeLatency: boolean) => {
@@ -310,31 +325,24 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           );
           const pipeData = pipeProfile?.data;
           const providerId = String(pipeData?.provider || "").trim();
-          if (!providerId || !isSubscribed) return;
+          if (!providerId || !isSubscribed) {
+            setApiMonitorData((prev) => ({
+              ...prev,
+              url: "",
+              latencyMs: null,
+            }));
+            return;
+          }
 
           const provProfile = await window.api?.pipelineV2ProfilesLoad?.(
             "api",
             providerId,
           );
           const provData = provProfile?.data;
-          if (
-            !provData ||
-            (!provData.url && !provData.baseUrl && !provData.base_url) ||
-            !isSubscribed
-          )
-            return;
+          if (!provData || !isSubscribed) return;
 
-          const targetUrl = (
-            provData.base_url ||
-            provData.baseUrl ||
-            provData.url ||
-            ""
-          ).trim();
-          const apiKey = (
-            provData.api_key ||
-            provData.apiKey ||
-            ""
-          ).trim();
+          const targetUrl = resolveProviderMonitorUrl(provData);
+          const apiKey = resolveProviderMonitorApiKey(provData);
           const rawConcurrency =
             pipeData?.settings?.concurrency ?? pipeData?.concurrency ?? 0;
           const resolvedConcurrency = Number.isFinite(Number(rawConcurrency))
@@ -343,10 +351,11 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           setApiMonitorData((prev) => ({
             ...prev,
             url: targetUrl,
+            latencyMs: targetUrl ? prev.latencyMs : null,
             concurrency: resolvedConcurrency,
           }));
 
-          if (!probeLatency) return;
+          if (!targetUrl || !probeLatency) return;
 
           const startAt = Date.now();
           const pingRes = await window.api?.pipelineV2ApiModels?.({
@@ -358,7 +367,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           if (isSubscribed) {
             setApiMonitorData((prev) => ({
               ...prev,
-              ping: pingRes?.ok ? Math.max(0, Date.now() - startAt) : null,
+              latencyMs: pingRes?.ok ? Math.max(0, Date.now() - startAt) : null,
             }));
           }
         } catch (e) {
@@ -581,8 +590,14 @@ export const Dashboard = forwardRef<any, DashboardProps>(
     const [isReordering, setIsReordering] = useState(false);
     const [configItem, setConfigItem] = useState<QueueItem | null>(null);
     const [logs, setLogs] = useState<string[]>([]);
+    const MAX_VISIBLE_LOG_LINES = 200;
     const MAX_HISTORY_LOG_LINES = 500;
     const MAX_HISTORY_LLAMA_LOG_LINES = 300;
+    const MAX_PREVIEW_BLOCKS = 240;
+    const MAX_PREVIEW_RENDER_BLOCKS = 120;
+    const MAX_PREVIEW_PERSIST_BLOCKS = 80;
+    const MAX_PREVIEW_PERSIST_CHARS = 180_000;
+    const MAX_HIGHLIGHT_LINE_CHARS = 400;
 
     const presetOptionLabel = (value: "novel" | "script" | "short") => {
       const labels = t.dashboard.promptPresetLabels;
@@ -721,6 +736,8 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       gpu: { time: number; value: number }[];
     }>({ chars: [], tokens: [], vram: [], gpu: [] });
     const chartRenderTimerRef = useRef<number | null>(null);
+    const v2SpeedSmootherRef = useRef(createV2SpeedSmoothingState());
+    const previewPersistAtRef = useRef(0);
     const MAX_CHART_POINTS = 3000;
     const CHART_RENDER_INTERVAL_MS = 150;
 
@@ -761,6 +778,10 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       if (typeof value !== "number" || !Number.isFinite(value)) return null;
       return value;
     };
+    const roundSpeed = (value: number, fractionDigits = 1): number =>
+      Number.isFinite(value) && value > 0
+        ? Number(value.toFixed(fractionDigits))
+        : 0;
     const lastJsonMonitorAtRef = useRef(0);
 
     useEffect(() => {
@@ -818,12 +839,27 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       }
     }, [modelPath, isRemoteMode]);
 
-    // Confirm sync with file_queue for legacy
+    // Keep queue ref synced for async handlers
     useEffect(() => {
-      // We might want to keep file_queue synced in case other parts use it,
-      // but library_queue is the master.
       queueRef.current = queue;
     }, [queue]);
+
+    const markQueueItemStatus = useCallback(
+      (
+        inputPath: string,
+        status: QueueItem["status"],
+        error?: string,
+      ): void => {
+        setQueue((prev) =>
+          prev.map((item) =>
+            item.path === inputPath
+              ? { ...item, status, error: error || undefined }
+              : item,
+          ),
+        );
+      },
+      [],
+    );
 
     useEffect(() => {
       return () => {
@@ -899,7 +935,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
             : code === null
               ? "❌ Process terminated unexpectedly (no exit code)"
               : `❌ Process exited with code ${code}`;
-      setLogs((prev) => [...prev, message]); // Keep English for logs for now or add keys later
+      setLogs((prev) => [...prev.slice(-MAX_VISIBLE_LOG_LINES), message]); // Keep English for logs for now or add keys later
 
       // Finalize history record
       if (currentRecordIdRef.current) {
@@ -951,7 +987,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           llamaLogs: llamaLogsBufferRef.current.slice(
             -MAX_HISTORY_LLAMA_LOG_LINES,
           ),
-          triggers: triggersBufferRef.current,
+          triggers: [...triggersBufferRef.current],
         });
         if (progressDataRef.current.outputPath) {
           setLastOutputPath(progressDataRef.current.outputPath);
@@ -1051,13 +1087,16 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           queueIndex >= 0 &&
           queueIndex < queue.length
         ) {
+          const queueStatus: QueueItem["status"] = stopRequested
+            ? "interrupted"
+            : "failed";
           const errorMessage = stopRequested
             ? t.dashboard.runStopped
             : t.dashboard.runFailed;
           setQueue((prev) =>
             prev.map((item, i) =>
               i === queueIndex
-                ? { ...item, status: "failed", error: errorMessage }
+                ? { ...item, status: queueStatus, error: errorMessage }
                 : item,
             ),
           );
@@ -1168,6 +1207,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           if (log.startsWith("JSON_PROGRESS:")) {
             try {
               const data = JSON.parse(log.substring("JSON_PROGRESS:".length));
+              const isV2Run = engineModeRef.current === "v2";
               const realtimeSpeedChars =
                 toFiniteNumber(data.realtime_speed_chars) ??
                 toFiniteNumber(data.speed_chars);
@@ -1180,9 +1220,47 @@ export const Dashboard = forwardRef<any, DashboardProps>(
               const realtimeSpeedEval =
                 toFiniteNumber(data.realtime_speed_eval) ??
                 toFiniteNumber(data.speed_eval);
-              const realtimeSpeedTokens =
-                toFiniteNumber(data.realtime_speed_tokens) ??
-                (realtimeSpeedGen ?? 0) + (realtimeSpeedEval ?? 0);
+              const avgSpeedChars = toFiniteNumber(data.avg_speed_chars);
+              const avgSpeedLines = toFiniteNumber(data.avg_speed_lines);
+              const avgSpeedGen = toFiniteNumber(data.avg_speed_gen);
+              const avgSpeedEval = toFiniteNumber(data.avg_speed_eval);
+
+              let effectiveSpeedChars = realtimeSpeedChars;
+              let effectiveSpeedLines = realtimeSpeedLines;
+              let effectiveSpeedGen = realtimeSpeedGen;
+              let effectiveSpeedEval = realtimeSpeedEval;
+
+              if (isV2Run) {
+                const smoothingResult = smoothV2SpeedMetrics(
+                  v2SpeedSmootherRef.current,
+                  {
+                    elapsedSec: toFiniteNumber(data.elapsed),
+                    realtime: {
+                      chars: realtimeSpeedChars,
+                      lines: realtimeSpeedLines,
+                      gen: realtimeSpeedGen,
+                      eval: realtimeSpeedEval,
+                    },
+                    average: {
+                      chars: avgSpeedChars,
+                      lines: avgSpeedLines,
+                      gen: avgSpeedGen,
+                      eval: avgSpeedEval,
+                    },
+                    totals: {
+                      chars: toFiniteNumber(data.total_chars),
+                      lines: toFiniteNumber(data.total_lines),
+                      gen: toFiniteNumber(data.total_output_tokens),
+                      eval: toFiniteNumber(data.total_input_tokens),
+                    },
+                  },
+                );
+                v2SpeedSmootherRef.current = smoothingResult.state;
+                effectiveSpeedChars = smoothingResult.speeds.chars;
+                effectiveSpeedLines = smoothingResult.speeds.lines;
+                effectiveSpeedGen = smoothingResult.speeds.gen;
+                effectiveSpeedEval = smoothingResult.speeds.eval;
+              }
 
               // 直接使用后端数据，不保留旧值(避免上一次运行的残留)
               setProgress((prev) => ({
@@ -1204,20 +1282,20 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                     ? Math.max(0, data.remaining)
                     : prev.remaining,
                 speedLines:
-                  typeof realtimeSpeedLines === "number"
-                    ? realtimeSpeedLines
+                  typeof effectiveSpeedLines === "number"
+                    ? roundSpeed(effectiveSpeedLines, 2)
                     : prev.speedLines,
                 speedChars:
-                  typeof realtimeSpeedChars === "number"
-                    ? realtimeSpeedChars
+                  typeof effectiveSpeedChars === "number"
+                    ? roundSpeed(effectiveSpeedChars, 1)
                     : prev.speedChars,
                 speedEval:
-                  typeof realtimeSpeedEval === "number"
-                    ? realtimeSpeedEval
+                  typeof effectiveSpeedEval === "number"
+                    ? roundSpeed(effectiveSpeedEval, 1)
                     : prev.speedEval,
                 speedGen:
-                  typeof realtimeSpeedGen === "number"
-                    ? realtimeSpeedGen
+                  typeof effectiveSpeedGen === "number"
+                    ? roundSpeed(effectiveSpeedGen, 1)
                     : prev.speedGen,
                 // If block changed, reset retries
                 retries: data.current !== prev.current ? 0 : prev.retries,
@@ -1241,7 +1319,10 @@ export const Dashboard = forwardRef<any, DashboardProps>(
               ) {
                 setApiMonitorData((prev) => ({
                   ...prev,
-                  ping: data.api_ping !== undefined ? data.api_ping : prev.ping,
+                  latencyMs:
+                    data.api_ping !== undefined
+                      ? data.api_ping
+                      : prev.latencyMs,
                   concurrency:
                     data.api_concurrency !== undefined
                       ? data.api_concurrency
@@ -1287,19 +1368,22 @@ export const Dashboard = forwardRef<any, DashboardProps>(
               const shouldUseProgressAsChartDriver =
                 engineModeRef.current === "v2" ||
                 Date.now() - lastJsonMonitorAtRef.current > 1500;
+              const effectiveSpeedTokens =
+                (effectiveSpeedGen ?? 0) + (effectiveSpeedEval ?? 0);
               if (
                 shouldUseProgressAsChartDriver &&
-                realtimeSpeedChars !== null &&
-                realtimeSpeedChars >= 0
+                effectiveSpeedChars !== null &&
+                Number.isFinite(effectiveSpeedChars) &&
+                effectiveSpeedChars >= 0
               ) {
-                pushChartPoint("chars", realtimeSpeedChars);
+                pushChartPoint("chars", effectiveSpeedChars);
               }
               if (
                 shouldUseProgressAsChartDriver &&
-                Number.isFinite(realtimeSpeedTokens) &&
-                realtimeSpeedTokens >= 0
+                Number.isFinite(effectiveSpeedTokens) &&
+                effectiveSpeedTokens >= 0
               ) {
-                pushChartPoint("tokens", realtimeSpeedTokens);
+                pushChartPoint("tokens", effectiveSpeedTokens);
               }
               scheduleChartRefresh();
             } catch (e) {
@@ -1317,13 +1401,15 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                   ? "rep_penalty_increase"
                   : data.type === "glossary"
                     ? "glossary_missed"
-                    : data.type === "empty"
-                      ? "empty_retry"
-                      : data.type === "anchor_missing"
-                        ? "anchor_missing"
-                        : data.type === "provider_error"
-                          ? "provider_error"
-                          : "line_mismatch";
+                    : data.type === "kana_residue"
+                      ? "kana_residue"
+                      : data.type === "empty"
+                        ? "empty_retry"
+                        : data.type === "anchor_missing"
+                          ? "anchor_missing"
+                          : data.type === "provider_error"
+                            ? "provider_error"
+                            : "line_mismatch";
               const retryMessages = t.dashboard.retryMessages;
               const coverageText =
                 typeof data.coverage === "number"
@@ -1344,24 +1430,27 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                           "{coverage}",
                           coverageText,
                         )
-                      : data.type === "empty"
-                        ? retryMessages.emptyBlock.replace(
-                            "{block}",
-                            String(data.block),
-                          )
-                        : data.type === "anchor_missing"
-                          ? retryMessages.anchorMissing.replace(
+                      : data.type === "kana_residue"
+                        ? retryMessages.kanaResidue ||
+                          retryMessages.lineMismatch
+                        : data.type === "empty"
+                          ? retryMessages.emptyBlock.replace(
                               "{block}",
                               String(data.block),
                             )
-                          : data.type === "provider_error"
-                            ? retryMessages.providerError
-                            : retryMessages.lineMismatch
-                                .replace("{block}", String(data.block))
-                                .replace(
-                                  "{diff}",
-                                  String(data.src_lines - data.dst_lines),
-                                ),
+                          : data.type === "anchor_missing"
+                            ? retryMessages.anchorMissing.replace(
+                                "{block}",
+                                String(data.block),
+                              )
+                            : data.type === "provider_error"
+                              ? retryMessages.providerError
+                              : retryMessages.lineMismatch
+                                  .replace("{block}", String(data.block))
+                                  .replace(
+                                    "{diff}",
+                                    String(data.src_lines - data.dst_lines),
+                                  ),
               });
               if (v2StatsRef.current) {
                 v2StatsRef.current = applyRetryEventToV2HistoryStats(
@@ -1378,23 +1467,65 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                   "JSON_PREVIEW_BLOCK:".length,
               );
               const data = JSON.parse(jsonStr);
-              // Update specific block
+              const blockIndex = Number(data.block);
+              if (!Number.isFinite(blockIndex)) return;
+              const normalizedBlockIndex = Math.max(0, Math.trunc(blockIndex));
+              const nextBlock = {
+                src: String(data.src || ""),
+                output: String(data.output || ""),
+              };
+
+              // Update specific block and keep preview window bounded
               setPreviewBlocks((prev) => {
                 const next = {
                   ...prev,
-                  [data.block]: { src: data.src, output: data.output },
+                  [normalizedBlockIndex]: nextBlock,
                 };
-                // Persist light-weight version? Or maybe persistence is less critical for realtime stream
-                // but if user reloads?
-                // Let's persist full blocks map?
-                try {
-                  localStorage.setItem(
-                    "last_preview_blocks",
-                    JSON.stringify(next),
-                  );
-                } catch (e) {
-                  // Best-effort persistence; ignore storage quota/runtime errors.
+
+                const sortedKeys = Object.keys(next)
+                  .map((key) => Number(key))
+                  .filter((value) => Number.isFinite(value))
+                  .sort((a, b) => a - b);
+                const overflow = sortedKeys.length - MAX_PREVIEW_BLOCKS;
+                if (overflow > 0) {
+                  const dropKeys = sortedKeys.slice(0, overflow);
+                  for (const key of dropKeys) {
+                    delete next[key];
+                  }
                 }
+
+                const now = Date.now();
+                if (now - previewPersistAtRef.current >= 800) {
+                  previewPersistAtRef.current = now;
+                  try {
+                    const persistedEntries = Object.entries(next)
+                      .sort((a, b) => Number(a[0]) - Number(b[0]))
+                      .slice(-MAX_PREVIEW_PERSIST_BLOCKS);
+                    const persistedPayload: Record<
+                      number,
+                      { src: string; output: string }
+                    > = {};
+                    let totalChars = 0;
+                    for (const [key, value] of persistedEntries) {
+                      const src = String(value?.src || "");
+                      const output = String(value?.output || "");
+                      totalChars += src.length + output.length;
+                      if (totalChars > MAX_PREVIEW_PERSIST_CHARS) break;
+                      persistedPayload[Number(key)] = { src, output };
+                    }
+                    if (Object.keys(persistedPayload).length > 0) {
+                      localStorage.setItem(
+                        "last_preview_blocks",
+                        JSON.stringify(persistedPayload),
+                      );
+                    } else {
+                      localStorage.removeItem("last_preview_blocks");
+                    }
+                  } catch {
+                    // Best-effort persistence; ignore storage/runtime errors.
+                  }
+                }
+
                 return next;
               });
             } catch (e) {
@@ -1499,7 +1630,9 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                   totalChars: data.outputChars,
                   avgSpeed: data.avgSpeed,
                   duration: data.totalTime,
-                  ...(v2StatsRef.current ? { v2Stats: v2StatsRef.current } : {}),
+                  ...(v2StatsRef.current
+                    ? { v2Stats: v2StatsRef.current }
+                    : {}),
                 });
               }
             } catch (e) {
@@ -1508,7 +1641,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
             return;
           } else {
             // Only add non-empty logs that aren't JSON events
-            setLogs((prev) => [...prev.slice(-200), log]);
+            setLogs((prev) => [...prev.slice(-MAX_VISIBLE_LOG_LINES), log]);
 
             // Buffer logs for history record
             logsBufferRef.current.push(log);
@@ -1534,10 +1667,26 @@ export const Dashboard = forwardRef<any, DashboardProps>(
     useEffect(() => {
       const unsubscribeV2Log = window.api?.onPipelineV2Log?.(
         (data: { runId?: string; message?: string; level?: string }) => {
+          const logRunId =
+            typeof data.runId === "string" ? data.runId.trim() : "";
+          if (
+            logRunId &&
+            activeRunIdRef.current &&
+            logRunId !== activeRunIdRef.current
+          ) {
+            return;
+          }
           const msg = (data.message || "").trim();
           if (!msg) return;
-          const prefix = data.level === "error" ? "[V2 stderr] " : "[V2] ";
-          setLogs((prev) => [...prev.slice(-200), `${prefix}${msg}`]);
+          const level = String(data.level || "").toLowerCase();
+          if (level !== "error" && level !== "warn" && level !== "critical") {
+            return;
+          }
+          const prefix = level === "error" ? "[V2 stderr] " : "[V2 warn] ";
+          setLogs((prev) => [
+            ...prev.slice(-MAX_VISIBLE_LOG_LINES),
+            `${prefix}${msg}`,
+          ]);
           logsBufferRef.current.push(`${prefix}${msg}`);
           if (logsBufferRef.current.length > MAX_HISTORY_LOG_LINES) {
             logsBufferRef.current = logsBufferRef.current.slice(
@@ -1681,6 +1830,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           ".srt",
           ".ass",
           ".ssa",
+          ".xlsx",
         ]);
 
         for (const path of paths) {
@@ -1821,21 +1971,21 @@ export const Dashboard = forwardRef<any, DashboardProps>(
         variant: "destructive",
         onConfirm: () => {
           setQueue([]);
-          localStorage.setItem("library_queue", JSON.stringify([]));
+          persistLibraryQueue([]);
         },
       });
     }, [t, showConfirm]);
 
     const handleRetryFailed = useCallback(() => {
-      const failedCount = queue.filter(
-        (item) => item.status === "failed",
+      const failedCount = queue.filter((item) =>
+        isRetryableQueueStatus(item.status),
       ).length;
       if (failedCount === 0) {
         pushQueueNotice({ type: "info", message: t.dashboard.retryFailedNone });
         return;
       }
       const nextQueue = queue.map((item) =>
-        item.status === "failed"
+        isRetryableQueueStatus(item.status)
           ? { ...item, status: "pending" as const, error: undefined }
           : item,
       );
@@ -1896,15 +2046,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
         }
 
         // 2. Handle File/Folder Drop
-        const items = Array.from(e.dataTransfer.items);
-        const paths: string[] = [];
-
-        for (const item of items) {
-          if (item.kind === "file") {
-            const file = item.getAsFile();
-            if (file && (file as any).path) paths.push((file as any).path);
-          }
-        }
+        const paths = extractElectronDragPaths(e.dataTransfer);
 
         if (paths.length > 0) {
           const finalPaths: string[] = [];
@@ -1956,6 +2098,16 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       setGlossaryPath(globalGlossary);
     };
 
+    const resolveRemotePrecheckUrl = (): string => {
+      if (!isRemoteModeRef.current) return "";
+      const sessionUrl = remoteRuntime?.runtime?.session?.url;
+      if (typeof sessionUrl === "string" && sessionUrl.trim()) {
+        return sessionUrl.trim();
+      }
+      const configuredUrl = localStorage.getItem("config_remote_url") || "";
+      return configuredUrl.trim();
+    };
+
     const startTranslation = (
       inputPath: string,
       forceResume?: boolean,
@@ -1979,6 +2131,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       }
       setChartData([]);
       chartHistoriesRef.current = { chars: [], tokens: [], vram: [], gpu: [] };
+      v2SpeedSmootherRef.current = createV2SpeedSmoothingState();
       setProgress({
         current: 0,
         total: 0,
@@ -1991,6 +2144,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
         speedGen: 0,
         retries: 0,
       });
+      setLogs([]);
       setApiMonitorData((prev) => ({
         ...prev,
         rpm: 0,
@@ -2012,6 +2166,13 @@ export const Dashboard = forwardRef<any, DashboardProps>(
 
       const resolvedPreRules = resolveRuleListForRun("pre", customConfig);
       const resolvedPostRules = resolveRuleListForRun("post", customConfig);
+      const toPctValue = (value: unknown, fallback: number): number => {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return fallback;
+        if (numeric <= 1 && numeric >= 0) return Math.round(numeric * 100);
+        if (numeric < 0) return 0;
+        return numeric;
+      };
 
       // 根据 ctx 自动计算 chunk-size
       const ctxValue =
@@ -2092,7 +2253,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
         // Quality Control Settings
         temperature:
           customConfig.temperature ??
-          parseFloat(localStorage.getItem("config_temperature") || "0.7"),
+          parseFloat(localStorage.getItem("config_temperature") || "0.3"),
 
         // Storage
         cacheDir: pickCustom(
@@ -2109,13 +2270,18 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           customConfig.lineToleranceAbs,
           parseInt(localStorage.getItem("config_line_tolerance_abs") || "10"),
         ),
-        lineTolerancePct: pickCustom(
-          customConfig.lineTolerancePct,
-          parseInt(localStorage.getItem("config_line_tolerance_pct") || "20"),
+        lineTolerancePct: toPctValue(
+          pickCustom(
+            customConfig.lineTolerancePct,
+            parseFloat(
+              localStorage.getItem("config_line_tolerance_pct") || "20",
+            ),
+          ),
+          20,
         ),
         anchorCheck: pickCustom(
           customConfig.anchorCheck,
-          localStorage.getItem("config_anchor_check") !== "false",
+          localStorage.getItem("config_anchor_check") === "true",
         ),
         anchorCheckRetries: pickCustom(
           customConfig.anchorCheckRetries,
@@ -2309,6 +2475,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       // Update local session state to match effective config for UI feedback
       setAlignmentMode(finalConfig.alignmentMode);
       setSaveCot(finalConfig.saveCot);
+      markQueueItemStatus(inputPath, "processing");
 
       window.api?.startTranslation(
         inputPath,
@@ -2323,12 +2490,17 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       inputPath: string,
       forceResume?: boolean,
       glossaryOverride?: string,
+      resumeArtifactPath?: string,
+      resumeOutputPathHint?: string,
     ) => {
       const item = queueRef.current.find((q) => q.path === inputPath);
       const itemConfig = item?.config;
       const customConfig: FileConfig =
         itemConfig && !itemConfig.useGlobalDefaults ? itemConfig : {};
-      const effectivePipelineId = resolveQueueItemPipelineId(item, v2PipelineId);
+      const effectivePipelineId = resolveQueueItemPipelineId(
+        item,
+        v2PipelineId,
+      );
       if (!effectivePipelineId) {
         showAlert({
           title: t.dashboard.selectPipelineTitle,
@@ -2355,6 +2527,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       }
       setChartData([]);
       chartHistoriesRef.current = { chars: [], tokens: [], vram: [], gpu: [] };
+      v2SpeedSmootherRef.current = createV2SpeedSmoothingState();
       setProgress({
         current: 0,
         total: 0,
@@ -2395,6 +2568,19 @@ export const Dashboard = forwardRef<any, DashboardProps>(
         customConfig.cacheDir !== undefined
           ? customConfig.cacheDir
           : localStorage.getItem("config_cache_dir") || "";
+      const resolvedResumeOutputPath = (() => {
+        const hintedPath = String(resumeOutputPathHint || "").trim();
+        if (hintedPath) return hintedPath;
+        const artifactPath = String(resumeArtifactPath || "").trim();
+        if (!artifactPath) return "";
+        if (artifactPath.endsWith(".temp.jsonl")) {
+          return artifactPath.slice(0, -".temp.jsonl".length);
+        }
+        if (artifactPath.endsWith(".cache.json")) {
+          return artifactPath.slice(0, -".cache.json".length);
+        }
+        return artifactPath;
+      })();
       progressDataRef.current = {
         total: 0,
         current: 0,
@@ -2402,7 +2588,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
         chars: 0,
         sourceLines: 0,
         sourceChars: 0,
-        outputPath: "",
+        outputPath: resolvedResumeOutputPath,
         cacheDir: String(resolvedCacheDir || ""),
         cachePath: "",
         speeds: [],
@@ -2438,8 +2624,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
             "chunk",
             String(pipelineData.chunk_policy),
           );
-          const rawChunkType =
-            chunkProfile?.data?.chunk_type ?? chunkProfile?.data?.type;
+          const rawChunkType = chunkProfile?.data?.chunk_type;
           const normalizedChunkType = normalizeChunkType(rawChunkType);
           if (normalizedChunkType) chunkType = normalizedChunkType;
         }
@@ -2469,6 +2654,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
         config: {
           engineMode: "v2",
           v2PipelineId: effectivePipelineId,
+          outputPath: resolvedResumeOutputPath || undefined,
           outputDir: resolvedOutputDir || undefined,
           cacheDir: resolvedCacheDir || undefined,
           resume: Boolean(resolvedResume),
@@ -2488,6 +2674,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       const cacheDir = resolvedCacheDir.trim();
 
       try {
+        markQueueItemStatus(inputPath, "processing");
         const rulesPreLocal = resolveRuleListForRun("pre", customConfig);
         const rulesPostLocal = resolveRuleListForRun("post", customConfig);
 
@@ -2495,6 +2682,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           filePath: inputPath,
           pipelineId: effectivePipelineId,
           profilesDir,
+          outputPath: resolvedResumeOutputPath || undefined,
           outputDir: outputDir || undefined,
           glossaryPath: resolvedGlossaryPath || undefined,
           resume: Boolean(resolvedResume),
@@ -2523,6 +2711,8 @@ export const Dashboard = forwardRef<any, DashboardProps>(
         if (result && !result.ok) {
           setIsRunning(false);
           currentRunEngineModeRef.current = null;
+          markQueueItemStatus(inputPath, "failed", t.dashboard.runFailed);
+          setCurrentQueueIndex(-1);
           setRunNotice({
             type: "error",
             message: t.dashboard.runFailed,
@@ -2531,6 +2721,8 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       } catch (err) {
         setIsRunning(false);
         currentRunEngineModeRef.current = null;
+        markQueueItemStatus(inputPath, "failed", t.dashboard.runFailed);
+        setCurrentQueueIndex(-1);
       }
     };
 
@@ -2566,9 +2758,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       const queueItem = queueRef.current[index];
       const itemConfig = queueItem?.config;
       const customConfig =
-        itemConfig && !itemConfig.useGlobalDefaults
-          ? itemConfig
-          : undefined;
+        itemConfig && !itemConfig.useGlobalDefaults ? itemConfig : undefined;
       const effectivePipelineId = resolveQueueItemPipelineId(
         queueItem,
         v2PipelineId,
@@ -2586,15 +2776,45 @@ export const Dashboard = forwardRef<any, DashboardProps>(
         customConfig?.outputDir !== undefined
           ? customConfig.outputDir
           : localStorage.getItem("config_output_dir") || "";
+      const cacheDir =
+        customConfig?.cacheDir !== undefined
+          ? customConfig.cacheDir
+          : localStorage.getItem("config_cache_dir") || "";
       const config = {
         engineMode: "v2",
         outputDir: outputDir || undefined,
+        cacheDir: cacheDir || undefined,
+        executionMode: (isRemoteMode ? "remote" : "local") as
+          | "local"
+          | "remote",
+        remoteUrl: isRemoteMode ? resolveRemotePrecheckUrl() : undefined,
       };
 
       const checkResult = await window.api?.checkOutputFileExists(
         inputPath,
         config,
       );
+
+      if (checkResult?.remoteCheckSkipped) {
+        const remoteHost = String(
+          checkResult.remoteHost || resolveRemotePrecheckUrl() || "-",
+        );
+        showConfirm({
+          title: t.dashboard.remotePrecheckTitle,
+          description: t.dashboard.remotePrecheckDesc.replace(
+            "{host}",
+            remoteHost,
+          ),
+          variant: "warning",
+          confirmText: t.dashboard.remotePrecheckConfirm,
+          cancelText: t.dashboard.remotePrecheckCancel,
+          onConfirm: () => {
+            setCurrentQueueIndex(index);
+            startV2Translation(inputPath);
+          },
+        });
+        return;
+      }
 
       if (checkResult?.exists && checkResult.path) {
         setConfirmModal({
@@ -2604,12 +2824,24 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           onResume: () => {
             setConfirmModal(null);
             setCurrentQueueIndex(index);
-            startV2Translation(inputPath, true);
+            startV2Translation(
+              inputPath,
+              true,
+              undefined,
+              checkResult.path,
+              checkResult.resumeOutputPath,
+            );
           },
           onOverwrite: () => {
             setConfirmModal(null);
             setCurrentQueueIndex(index);
-            startV2Translation(inputPath, false);
+            startV2Translation(
+              inputPath,
+              false,
+              undefined,
+              checkResult.path,
+              checkResult.resumeOutputPath,
+            );
           },
           onSkip:
             index < queue.length - 1
@@ -2667,6 +2899,10 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           customConfig?.outputDir || localStorage.getItem("config_output_dir"),
         modelPath: effectiveModelPath, // 传递模型路径用于生成输出文件名
         remoteModel: isRemoteMode ? effectiveModelPath : undefined,
+        executionMode: (isRemoteMode ? "remote" : "local") as
+          | "local"
+          | "remote",
+        remoteUrl: isRemoteMode ? resolveRemotePrecheckUrl() : undefined,
       };
 
       // --- Auto-Match Glossary Logic (Refined) ---
@@ -2697,6 +2933,31 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       console.log("[checkAndStart] inputPath:", inputPath);
       console.log("[checkAndStart] config:", config);
       console.log("[checkAndStart] checkResult:", checkResult);
+
+      if (checkResult?.remoteCheckSkipped) {
+        const remoteHost = String(
+          checkResult.remoteHost || resolveRemotePrecheckUrl() || "-",
+        );
+        showConfirm({
+          title: t.dashboard.remotePrecheckTitle,
+          description: t.dashboard.remotePrecheckDesc.replace(
+            "{host}",
+            remoteHost,
+          ),
+          variant: "warning",
+          confirmText: t.dashboard.remotePrecheckConfirm,
+          cancelText: t.dashboard.remotePrecheckCancel,
+          onConfirm: () => {
+            setCurrentQueueIndex(index);
+            startTranslation(
+              inputPath,
+              undefined,
+              matchedGlossary || undefined,
+            );
+          },
+        });
+        return;
+      }
 
       if (checkResult?.exists && checkResult.path) {
         setConfirmModal({
@@ -2763,19 +3024,15 @@ export const Dashboard = forwardRef<any, DashboardProps>(
     });
 
     const handleStop = () => {
-      const runningMode = currentRunEngineModeRef.current || engineModeRef.current;
-      console.log(
-        `[Dashboard] User requested stop (mode=${runningMode})`,
-      );
+      const runningMode =
+        currentRunEngineModeRef.current || engineModeRef.current;
+      console.log(`[Dashboard] User requested stop (mode=${runningMode})`);
       if (runningMode === "v2") {
         window.api?.pipelineV2Stop?.();
       } else {
         window.api?.stopTranslation();
       }
-      // 立即更新 UI 状态(后端也会发送 process-exit 事件)
-      setIsRunning(false);
-      setCurrentQueueIndex(-1);
-      currentRunEngineModeRef.current = null;
+      // 交由 process-exit 统一收敛状态，避免“新任务启动后被旧退出事件误伤”的竞态。
     };
 
     const requestStop = () => {
@@ -2872,6 +3129,12 @@ export const Dashboard = forwardRef<any, DashboardProps>(
       );
 
       if (!compareText) return text;
+      if (
+        text.length > MAX_HIGHLIGHT_LINE_CHARS ||
+        compareText.length > MAX_HIGHLIGHT_LINE_CHARS
+      ) {
+        return text;
+      }
 
       const cjkRegex = /[\u4e00-\u9fff\u3400-\u4dbf]/g;
 
@@ -2952,9 +3215,13 @@ export const Dashboard = forwardRef<any, DashboardProps>(
 
     // 块级对齐预览渲染 (Block-Aligned)
     const renderBlockAlignedPreview = () => {
-      const blocks = Object.entries(previewBlocks).sort(
+      const sortedBlocks = Object.entries(previewBlocks).sort(
         (a, b) => Number(a[0]) - Number(b[0]),
       );
+      const blocks =
+        sortedBlocks.length > MAX_PREVIEW_RENDER_BLOCKS
+          ? sortedBlocks.slice(-MAX_PREVIEW_RENDER_BLOCKS)
+          : sortedBlocks;
 
       // 恢复总统计信息
       let totalSrcLines = 0;
@@ -3158,7 +3425,9 @@ export const Dashboard = forwardRef<any, DashboardProps>(
           },
         }[queueNotice.type]
       : null;
-    const failedCount = queue.filter((item) => item.status === "failed").length;
+    const failedCount = queue.filter((item) =>
+      isRetryableQueueStatus(item.status),
+    ).length;
     const completedCount = queue.filter(
       (item) => item.status === "completed",
     ).length;
@@ -3487,14 +3756,10 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                 <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
                 <div>
                   <p className="font-bold text-amber-500 text-sm">
-                    {lang === "en"
-                      ? "No API Plan Selected"
-                      : "未选择 API 翻译方案"}
+                    {t.dashboard.apiPlanMissingTitle}
                   </p>
                   <p className="text-xs text-amber-400 mt-1">
-                    {lang === "en"
-                      ? "Please create and select an API translation plan in the API Manager."
-                      : "请先在「API 管理」中创建并选择一个翻译方案。"}
+                    {t.dashboard.apiPlanMissingDesc}
                   </p>
                 </div>
               </div>
@@ -3561,16 +3826,8 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                   }
                   className={`bg-card/80 hover:bg-card px-3 py-2 rounded-lg border flex items-center gap-3 transition-all cursor-pointer ${!v2PipelineId ? "border-amber-500/50 ring-1 ring-amber-500/20" : "border-border/50 hover:border-border"}`}
                 >
-                  <UITooltip
-                    content={
-                      lang === "en"
-                        ? "Switch to Local Mode"
-                        : "切换到本地翻译模式"
-                    }
-                  >
-                    <div
-                      className="w-7 h-7 shrink-0 rounded-lg bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center text-white cursor-pointer hover:scale-110 transition-transform relative"
-                    >
+                  <UITooltip content={t.dashboard.switchToLocalMode}>
+                    <div className="w-7 h-7 shrink-0 rounded-lg bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center text-white cursor-pointer hover:scale-110 transition-transform relative">
                       <Zap className="w-3.5 h-3.5" />
                       <span className="absolute -top-1 -right-1 text-[7px] bg-violet-500 text-white px-0.5 rounded font-bold leading-tight">
                         API
@@ -3579,16 +3836,16 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                   </UITooltip>
                   <div className="flex-1 min-w-0">
                     <span className="text-[9px] text-muted-foreground font-medium uppercase tracking-wider">
-                      {lang === "en" ? "API Translation Plan" : "API 翻译方案"}
+                      {t.dashboard.apiPlanLabel}
                     </span>
-                    <select
-                      className="w-full bg-transparent text-sm font-medium text-foreground outline-none cursor-pointer truncate -ml-0.5"
+                    <Select
+                      className={topBarSelectClass}
                       data-engine-switch-ignore="true"
                       value={v2PipelineId}
                       onChange={(e) => setV2PipelineId(e.target.value)}
                     >
                       <option value="">
-                        {lang === "en" ? "Select plan..." : "请选择方案..."}
+                        {t.dashboard.selectPipelinePlaceholder}
                       </option>
                       {v2Profiles.map((p) => (
                         <option key={p.id} value={p.id}>
@@ -3596,7 +3853,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                           {p.providerName ? ` (${p.providerName})` : ""}
                         </option>
                       ))}
-                    </select>
+                    </Select>
                   </div>
                 </div>
               ) : (
@@ -3606,19 +3863,11 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                   }
                   className={`bg-card/80 hover:bg-card px-3 py-2 rounded-lg border flex items-center gap-3 transition-all cursor-pointer ${!activeModelPath && activeModelsCount > 0 ? "border-amber-500/50 ring-1 ring-amber-500/20" : "border-border/50 hover:border-border"}`}
                 >
-                  <UITooltip
-                    content={
-                      lang === "en"
-                        ? "Switch to API Mode"
-                        : "切换到 API 翻译模式"
-                    }
-                  >
-                    <div
-                      className="w-7 h-7 shrink-0 rounded-lg bg-gradient-to-br from-blue-500 to-blue-600 flex items-center justify-center text-white cursor-pointer hover:scale-110 transition-transform relative"
-                    >
+                  <UITooltip content={t.dashboard.switchToApiMode}>
+                    <div className="w-7 h-7 shrink-0 rounded-lg bg-gradient-to-br from-blue-500 to-blue-600 flex items-center justify-center text-white cursor-pointer hover:scale-110 transition-transform relative">
                       <Bot className="w-3.5 h-3.5" />
                       <span className="absolute -top-1 -right-1 text-[7px] bg-blue-500 text-white px-0.5 rounded font-bold leading-tight">
-                        {lang === "en" ? "Local" : "本地"}
+                        {t.dashboard.localModeBadge}
                       </span>
                     </div>
                   </UITooltip>
@@ -3650,8 +3899,8 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                         </div>
                       )}
                     </div>
-                    <select
-                      className="w-full bg-transparent text-sm font-medium text-foreground outline-none cursor-pointer truncate -ml-0.5"
+                    <Select
+                      className={topBarSelectClass}
                       data-engine-switch-ignore="true"
                       value={activeModelPath}
                       onChange={(e) => {
@@ -3697,7 +3946,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                                 {m.replace(".gguf", "")}
                               </option>
                             ))}
-                    </select>
+                    </Select>
                   </div>
                   <div
                     data-engine-switch-ignore="true"
@@ -3726,8 +3975,8 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                     <span className="text-[9px] text-muted-foreground font-medium uppercase tracking-wider">
                       Prompt Preset
                     </span>
-                    <select
-                      className="w-full bg-transparent text-sm font-medium text-foreground outline-none cursor-pointer truncate -ml-0.5"
+                    <Select
+                      className={topBarSelectClass}
                       data-engine-switch-ignore="true"
                       value={promptPreset}
                       onChange={(e) => handlePromptPresetChange(e.target.value)}
@@ -3741,7 +3990,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                       <option value="short">
                         {presetOptionLabel("short")}
                       </option>
-                    </select>
+                    </Select>
                   </div>
                 </div>
               )}
@@ -3754,8 +4003,8 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                   <span className="text-[9px] text-muted-foreground font-medium uppercase tracking-wider">
                     {t.dashboard.glossaryLabel}
                   </span>
-                  <select
-                    className="w-full bg-transparent text-sm font-medium text-foreground outline-none cursor-pointer truncate -ml-0.5"
+                  <Select
+                    className={topBarSelectClass}
                     data-engine-switch-ignore="true"
                     value={glossaryPath}
                     onChange={(e) => {
@@ -3774,7 +4023,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                         {g.label}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                 </div>
               </div>
             </div>
@@ -3929,7 +4178,8 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                   </span>
                   <div className="flex items-center gap-2">
                     <div className="relative">
-                      <select
+                      <Select
+                        menuAlign="center"
                         value={chartMode}
                         onChange={(e) => setChartMode(e.target.value as any)}
                         className="appearance-none bg-accent/50 border border-border/50 rounded px-2 py-0.5 text-[9px] font-medium text-foreground pr-5 focus:outline-none hover:bg-accent cursor-pointer"
@@ -3942,7 +4192,7 @@ export const Dashboard = forwardRef<any, DashboardProps>(
                         {engineMode !== "v2" && (
                           <option value="gpu">GPU %</option>
                         )}
-                      </select>
+                      </Select>
                       <ChevronDown className="w-2.5 h-2.5 absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
                     </div>
                   </div>

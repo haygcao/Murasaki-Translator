@@ -57,11 +57,40 @@ class ProfileStore:
     @staticmethod
     def _normalize_chunk_type(value: Any) -> str:
         raw = str(value or "").strip().lower()
-        if raw == "legacy":
-            return "block"
         if raw in {"block", "line"}:
             return raw
         return ""
+
+    @staticmethod
+    def _parse_bool_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        normalized = str(value or "").strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+        return bool(value)
+
+    def _normalize_profile_data(self, kind: str, data: Dict[str, Any]) -> bool:
+        changed = False
+
+        if kind == "api" and "strict_concurrency" in data:
+            strict_value = self._parse_bool_flag(data.get("strict_concurrency"))
+            if data.get("strict_concurrency") != strict_value:
+                data["strict_concurrency"] = strict_value
+                changed = True
+
+        if kind == "chunk":
+            raw_chunk_type = data.get("chunk_type") or ""
+            normalized = self._normalize_chunk_type(raw_chunk_type)
+            if normalized and data.get("chunk_type") != normalized:
+                data["chunk_type"] = normalized
+                changed = True
+
+        return changed
 
     def list_profiles(self, kind: str) -> List[ProfileRef]:
         result: List[ProfileRef] = []
@@ -83,7 +112,7 @@ class ProfileStore:
             display_name = str(data.get("name") or profile_id)
             chunk_type = None
             if kind == "chunk":
-                raw_chunk_type = data.get("chunk_type") or data.get("type") or ""
+                raw_chunk_type = data.get("chunk_type") or ""
                 normalized = self._normalize_chunk_type(raw_chunk_type)
                 if normalized:
                     chunk_type = normalized
@@ -118,12 +147,20 @@ class ProfileStore:
         else:
             data["id"] = fallback_id
         data.setdefault("name", data.get("id"))
+        kind = os.path.basename(os.path.dirname(path))
+        if self._normalize_profile_data(kind, data):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump(
+                        data,
+                        f,
+                        sort_keys=False,
+                        allow_unicode=True,
+                    )
+            except Exception:
+                # normalization writeback is best-effort; keep in-memory data
+                pass
         data.setdefault("_path", path)
-        if os.path.basename(os.path.dirname(path)) == "chunk":
-            raw_chunk_type = data.get("chunk_type") or data.get("type") or ""
-            normalized = self._normalize_chunk_type(raw_chunk_type)
-            if normalized:
-                data["chunk_type"] = normalized
         return data
 
     def resolve_profile_path(self, kind: str, ref: str) -> Optional[str]:

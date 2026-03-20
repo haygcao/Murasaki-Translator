@@ -62,6 +62,8 @@ const api = {
       config,
       runId,
     }),
+  reportActiveView: (view: string) =>
+    ipcRenderer.send("renderer-active-view", view),
   pipelineV2ProfilesPath: () => ipcRenderer.invoke("pipelinev2-profiles-path"),
   pipelineV2ProfilesList: (kind: string, options?: { preferLocal?: boolean }) =>
     ipcRenderer.invoke("pipelinev2-profiles-list", kind, options),
@@ -106,14 +108,26 @@ const api = {
   }) => ipcRenderer.invoke("api-stats-overview", payload),
   apiStatsTrend: (payload: {
     apiProfileId?: string;
-    metric?: "requests" | "latency" | "input_tokens" | "output_tokens";
+    metric?:
+      | "requests"
+      | "latency"
+      | "input_tokens"
+      | "output_tokens"
+      | "error_rate"
+      | "success_rate";
     interval?: "minute" | "hour" | "day";
     fromTs?: string;
     toTs?: string;
   }) => ipcRenderer.invoke("api-stats-trend", payload),
   apiStatsBreakdown: (payload: {
     apiProfileId?: string;
-    dimension?: "status_code" | "source" | "error_type" | "model" | "hour";
+    dimension?:
+      | "status_code"
+      | "status_class"
+      | "source"
+      | "error_type"
+      | "model"
+      | "hour";
     fromTs?: string;
     toTs?: string;
   }) => ipcRenderer.invoke("api-stats-breakdown", payload),
@@ -130,6 +144,7 @@ const api = {
   }) => ipcRenderer.invoke("api-stats-records", payload),
   apiStatsClear: (payload: { apiProfileId?: string; beforeTs?: string }) =>
     ipcRenderer.invoke("api-stats-clear", payload),
+  clipboardWrite: (text: string) => ipcRenderer.invoke("clipboard-write", text),
   pipelineV2Run: (payload: {
     filePath: string;
     pipelineId: string;
@@ -171,6 +186,8 @@ const api = {
         callback({ code: payload, signal: null, stopRequested: false });
         return;
       }
+      const rawRunId =
+        typeof payload?.runId === "string" ? payload.runId.trim() : "";
       callback({
         code:
           typeof payload?.code === "number" || payload?.code === null
@@ -181,6 +198,7 @@ const api = {
             ? payload.signal
             : null,
         stopRequested: Boolean(payload?.stopRequested),
+        runId: rawRunId || undefined,
       });
     }),
 
@@ -207,6 +225,15 @@ const api = {
   loadCache: (cachePath: string) => ipcRenderer.invoke("load-cache", cachePath),
   saveCache: (cachePath: string, data: any) =>
     ipcRenderer.invoke("save-cache", cachePath, data),
+  historyDetailLoad: (id: string) =>
+    ipcRenderer.invoke("history-detail-load", id),
+  historyDetailSave: (id: string, detail: any) =>
+    ipcRenderer.invoke("history-detail-save", id, detail),
+  historyDetailDelete: (id: string) =>
+    ipcRenderer.invoke("history-detail-delete", id),
+  historyDetailPrune: (allowedIds: string[]) =>
+    ipcRenderer.invoke("history-detail-prune", allowedIds),
+  historyDetailClearAll: () => ipcRenderer.invoke("history-detail-clear-all"),
   rebuildDoc: (options: { cachePath: string; outputPath?: string }) =>
     ipcRenderer.invoke("rebuild-doc", options),
   writeFile: (path: string, content: string) =>

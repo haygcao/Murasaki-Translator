@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/github/v/release/soundstarrain/Murasaki-Translator?style=flat-square&color=8a2be2&label=Download)](https://github.com/soundstarrain/Murasaki-Translator/releases)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square)](./LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20|%20macOS%20|%20Linux-0078D6?style=flat-square)](https://github.com/soundstarrain/Murasaki-Translator/releases)
-[![Model](https://img.shields.io/badge/Model-Murasaki_LLM-FFD21E?style=flat-square&logo=huggingface&logoColor=black)](https://huggingface.co/Murasaki-Project)
+[![Model](https://img.shields.io/badge/%F0%9F%A4%97%20Model-Murasaki_LLM-FFD21E?style=flat-square)](https://huggingface.co/Murasaki-Project)
 
 <br>
 
@@ -23,7 +23,7 @@
 
 ---
 
-**Murasaki Translator** 是 **Murasaki 系列模型** 的官方配套推理引擎。
+**Murasaki Translator** 是 **Murasaki 系列模型** 的官方配套推理引擎。除了本地模型，还支持所有 **OpenAI 兼容格式的在线 API** 进行翻译。
 
 **Murasaki 系列模型** 是针对 ACGN 领域特化微调的翻译模型，其训练数据中 90% 以上为高质量的段落级长文本。模型原生支持 **Chain-of-Thought (CoT)** 思维链机制，具备结合长上下文进行精准 ACGN 文本翻译的能力。
 
@@ -39,8 +39,6 @@
 本项目基于 Murasaki 系列模型的原生 CoT 能力和长上下文特性，专门设计并优化了翻译引擎。我们对模型底层格式及特性进行了深度的适配与工程优化，底层采用 **llama.cpp** 推理框架，前端使用 **Electron + React** 构建，旨在为轻小说翻译提供一个轻量级、高性能且功能完备的解决方案。
 
 ## 功能特性
-
-本项目是专为 Murasaki 模型打造的完整翻译工作流前端，针对轻小说长文本翻译场景进行了深度的工程化适配。
 
 ### 1. 交互体验与硬件监控
 提供完整的可视化翻译工作台。支持文件与文件夹的递归拖拽导入，系统会自动建立批量翻译队列。
@@ -94,6 +92,7 @@ Murasaki 模型针对术语表进行了特化训练，支持 **Prompt 级术语�
 > **显存需求**
 > | 模型 | 最低显存 | 推荐显存 |
 > |------|----------|----------|
+> | Murasaki-4B | 4 GB | 6 GB+ |
 > | Murasaki-8B | 6 GB | 8 GB+ |
 > | Murasaki-14B | 10 GB | 12 GB+ |
 > 
@@ -127,7 +126,7 @@ Murasaki 模型针对术语表进行了特化训练，支持 **Prompt 级术语�
 - **在线 API**：选择已配置的 API Pipeline 后开始翻译。
 
 若使用本地模型模式，将下载的模型文件放入 `models` 目录中。(通过模型管理内置下载器下载的可以跳过这一步直接开始翻译)
-   - Windows: `解压目录\resources\middleware\models`
+   - Windows: `解压目录\app\resources\middleware\models`
    - macOS: `应用程序/Murasaki Translator.app/Contents/Resources/middleware/models`
 
 ### Linux Server 远程部署（API）
@@ -201,7 +200,7 @@ ssh -N -L 8000:127.0.0.1:8000 user@your-server
 
 我们会持续改进 Murasaki Translator 的体验，未来的开发重点有：
 
-- [ ] **多格式文档支持**：计划扩展对多种文件格式的支持，特别是针对 **RPG** 及 **Galgame** 脚本等游戏文本格式的直接解析与翻译。
+- [x] **多格式文档支持**：计划扩展对多种文件格式的支持，特别是针对 **RPG** 及 **Galgame** 脚本等游戏文本格式的直接解析与翻译。
 - [x] **跨平台支持**：已支持 Windows、macOS (Apple Silicon/Intel)、Linux (AppImage)。
 - [x] **Linux Server 后端**：已提供 Linux CLI 服务端，支持 OpenAI 兼容 API 接口，适用于远程推理部署。
 - [x] **在线 API 翻译（OpenAI 兼容）**：已支持兼容 OpenAI 格式的在线 API 翻译与 API 管理中心配置。
@@ -209,6 +208,10 @@ ssh -N -L 8000:127.0.0.1:8000 user@your-server
 - [ ] **模型迭代**：持续更新模型训练，发布质量更高、针对性更强的新版本模型。
 
 ---
+
+## Star趋势
+
+[![Star历史图表](https://starchart.cc/soundstarrain/Murasaki-Translator.svg)](https://starchart.cc/soundstarrain/Murasaki-Translator)
 
 ## 协议与致谢
 

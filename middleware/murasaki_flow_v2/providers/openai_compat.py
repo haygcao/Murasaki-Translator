@@ -130,7 +130,22 @@ class OpenAICompatProvider(BaseProvider):
         except (TypeError, ValueError):
             rpm_value = 0
         self._rpm_limiter = _RpmLimiter(rpm_value) if rpm_value > 0 else None
-        self._session = requests.Session()
+        # requests.Session is not guaranteed thread-safe for concurrent writes.
+        # Keep one session per worker thread to avoid cross-thread state races.
+        # Keep a legacy override hook for tests/monkeypatch paths that inject
+        # `provider._session = mock_session`.
+        self._session = None
+        self._session_local = threading.local()
+
+    def _get_session(self) -> requests.Session:
+        legacy_session = getattr(self, "_session", None)
+        if legacy_session is not None:
+            return legacy_session
+        session = getattr(self._session_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._session_local.session = session
+        return session
 
     def _pick_api_key(self) -> str:
         if not self._api_keys:
@@ -240,7 +255,7 @@ class OpenAICompatProvider(BaseProvider):
 
         start = time.perf_counter()
         try:
-            resp = self._session.post(
+            resp = self._get_session().post(
                 url,
                 headers=headers,
                 data=json.dumps(payload, ensure_ascii=False),
@@ -254,6 +269,7 @@ class OpenAICompatProvider(BaseProvider):
                 request_id=request.request_id,
                 duration_ms=duration_ms,
                 url=url,
+                request_headers=safe_request_headers,
             ) from exc
         except requests.RequestException as exc:
             duration_ms = int((time.perf_counter() - start) * 1000)
@@ -263,6 +279,7 @@ class OpenAICompatProvider(BaseProvider):
                 request_id=request.request_id,
                 duration_ms=duration_ms,
                 url=url,
+                request_headers=safe_request_headers,
             ) from exc
 
         duration_ms = int((time.perf_counter() - start) * 1000)
@@ -287,11 +304,15 @@ class OpenAICompatProvider(BaseProvider):
                 duration_ms=duration_ms,
                 url=url,
                 response_text=body_preview,
+                request_headers=safe_request_headers,
+                response_headers=safe_response_headers,
             )
 
         try:
             data = resp.json()
         except ValueError as exc:
+            body = (resp.text or "").strip()
+            body_preview = body[:MAX_ERROR_TEXT_CHARS]
             raise ProviderError(
                 "OpenAI-compatible response is not JSON",
                 error_type="invalid_json",
@@ -299,11 +320,16 @@ class OpenAICompatProvider(BaseProvider):
                 request_id=request.request_id,
                 duration_ms=duration_ms,
                 url=url,
+                response_text=body_preview,
+                request_headers=safe_request_headers,
+                response_headers=safe_response_headers,
             ) from exc
 
         try:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
+            body = (resp.text or "").strip()
+            body_preview = body[:MAX_ERROR_TEXT_CHARS]
             raise ProviderError(
                 "OpenAI-compatible response missing content",
                 error_type="invalid_response",
@@ -311,6 +337,9 @@ class OpenAICompatProvider(BaseProvider):
                 request_id=request.request_id,
                 duration_ms=duration_ms,
                 url=url,
+                response_text=body_preview,
+                request_headers=safe_request_headers,
+                response_headers=safe_response_headers,
             ) from exc
 
         usage = _extract_usage(data)

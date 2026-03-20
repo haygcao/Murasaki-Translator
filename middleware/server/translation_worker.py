@@ -30,6 +30,40 @@ from datetime import datetime
 # 添加父目录到 path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+_CUDA_DEVICE_TOKEN_PATTERN = re.compile(
+    r"^(?:-1|\d+|GPU-[A-Za-z0-9-]+|MIG-[A-Za-z0-9/-]+)$",
+    re.IGNORECASE,
+)
+
+
+def normalize_cuda_visible_devices(raw_value: Any) -> Optional[str]:
+    """规范化 CUDA_VISIBLE_DEVICES 输入，支持多卡编号/UUID。"""
+    if raw_value is None:
+        return None
+    raw = str(raw_value).strip()
+    if not raw:
+        return None
+
+    tokens = [token.strip() for token in re.split(r"[,;\s，；]+", raw) if token.strip()]
+    if not tokens:
+        return None
+
+    normalized: List[str] = []
+    seen = set()
+
+    for token in tokens:
+        if not _CUDA_DEVICE_TOKEN_PATTERN.match(token):
+            continue
+        canonical = str(int(token)) if token.isdigit() else token
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        normalized.append(canonical)
+
+    if not normalized:
+        return None
+    return ",".join(normalized)
+
 
 class TaskStatus(Enum):
     """任务状态"""
@@ -65,14 +99,119 @@ class TranslationTask:
     # 控制
     cancel_requested: bool = False
     _process: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
+    _state_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+        init=False,
+    )
 
     def add_log(self, message: str):
         """添加日志，自动限制条数防止内存膨胀"""
-        self.logs.append(message)
-        # 超过限制时只保留最新的日志（使用安全的切片逻辑）
-        if len(self.logs) > self.MAX_LOG_LINES:
-            # 只保留最新的 MAX_LOG_LINES 条，避免复杂的头尾拼接导致错乱
-            self.logs = self.logs[-self.MAX_LOG_LINES:]
+        with self._state_lock:
+            self.logs.append(message)
+            # 超过限制时只保留最新的日志（使用安全的切片逻辑）
+            if len(self.logs) > self.MAX_LOG_LINES:
+                # 只保留最新的 MAX_LOG_LINES 条，避免复杂的头尾拼接导致错乱
+                self.logs = self.logs[-self.MAX_LOG_LINES:]
+
+    def request_cancel(self):
+        with self._state_lock:
+            self.cancel_requested = True
+
+    def is_cancel_requested(self) -> bool:
+        with self._state_lock:
+            return self.cancel_requested
+
+    def set_process(self, process: Optional[asyncio.subprocess.Process]):
+        with self._state_lock:
+            self._process = process
+
+    def get_process(self) -> Optional[asyncio.subprocess.Process]:
+        with self._state_lock:
+            return self._process
+
+    def set_output_path(self, output_path: str):
+        with self._state_lock:
+            self.output_path = output_path
+
+    def get_output_path(self) -> Optional[str]:
+        with self._state_lock:
+            return self.output_path
+
+    def set_status(self, status: TaskStatus):
+        with self._state_lock:
+            self.status = status
+
+    def get_status(self) -> TaskStatus:
+        with self._state_lock:
+            return self.status
+
+    def set_progress(self, progress: float, current_block: int, total_blocks: int):
+        with self._state_lock:
+            self.progress = progress
+            self.current_block = current_block
+            self.total_blocks = total_blocks
+
+    def get_progress(self) -> tuple[float, int, int]:
+        with self._state_lock:
+            return self.progress, self.current_block, self.total_blocks
+
+    def set_result(self, result: Optional[str]):
+        with self._state_lock:
+            self.result = result
+
+    def set_error(self, error: Optional[str]):
+        with self._state_lock:
+            self.error = error
+
+    def with_state_lock(self):
+        return self._state_lock
+
+    def snapshot_status(self, *, log_from: Optional[int], log_limit: int) -> dict:
+        with self._state_lock:
+            log_total = len(self.logs)
+            logs_truncated = False
+
+            if log_from is None:
+                # 兼容旧客户端：默认返回最近 50 条
+                start_index = max(0, log_total - 50)
+                logs = self.logs[start_index:]
+                logs_truncated = start_index > 0
+                next_log_index = start_index + len(logs)
+            else:
+                start_index = min(log_from, log_total)
+                end_index = min(log_total, start_index + log_limit)
+                logs = self.logs[start_index:end_index]
+                next_log_index = start_index + len(logs)
+
+            return {
+                "status": self.status,
+                "progress": self.progress,
+                "current_block": self.current_block,
+                "total_blocks": self.total_blocks,
+                "logs": logs,
+                "next_log_index": next_log_index,
+                "log_total": log_total,
+                "logs_truncated": logs_truncated,
+                "result": self.result,
+                "error": self.error,
+            }
+
+    def snapshot_realtime(self, log_from: int) -> dict:
+        with self._state_lock:
+            log_total = len(self.logs)
+            start_index = min(log_from, log_total)
+            logs = self.logs[start_index:]
+            return {
+                "status": self.status,
+                "progress": self.progress,
+                "current_block": self.current_block,
+                "total_blocks": self.total_blocks,
+                "logs": logs,
+                "next_log_index": start_index + len(logs),
+                "result": self.result,
+                "error": self.error,
+            }
 
 
 class TranslationWorker:
@@ -122,6 +261,17 @@ class TranslationWorker:
             return True
         except ValueError:
             return False
+
+    @staticmethod
+    def _is_valid_models_response(resp: Any) -> bool:
+        """Validate /v1/models payload to avoid false-positive HTTP 200 pages."""
+        if resp is None or getattr(resp, "status_code", None) != 200:
+            return False
+        try:
+            payload = resp.json()
+        except Exception:
+            return False
+        return isinstance(payload, dict) and isinstance(payload.get("data"), list)
 
     def _cleanup_stale_temp_artifacts(self):
         """清理上次异常退出残留的临时规则/保护文件"""
@@ -370,8 +520,8 @@ class TranslationWorker:
                 raise RuntimeError(f"llama-server exited with code {self.server_process.returncode}")
 
             try:
-                resp = requests.get(url, timeout=2)
-                if resp.status_code == 200:
+                resp = await asyncio.to_thread(requests.get, url, timeout=2)
+                if self._is_valid_models_response(resp):
                     return
             except requests.RequestException:
                 pass
@@ -570,8 +720,10 @@ class TranslationWorker:
             # 准备输出路径
             output_dir = middleware_dir / "outputs"
             output_dir.mkdir(exist_ok=True)
-            output_path = output_dir / f"{task.task_id}_output.txt"
-            task.output_path = str(output_path)
+            input_suffix = Path(input_path).suffix if input_path else ""
+            output_suffix = input_suffix or ".txt"
+            output_path = output_dir / f"{task.task_id}_output{output_suffix}"
+            task.set_output_path(str(output_path))
 
             def _write_temp_json(prefix: str, payload: Any) -> str:
                 temp_file = tempfile.NamedTemporaryFile(
@@ -750,8 +902,15 @@ class TranslationWorker:
             # 设置环境变量确保日志即时性
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
-            if request.gpu_device_id:
-                env["CUDA_VISIBLE_DEVICES"] = str(request.gpu_device_id)
+            normalized_gpu_device_id = normalize_cuda_visible_devices(
+                request.gpu_device_id
+            )
+            if normalized_gpu_device_id:
+                env["CUDA_VISIBLE_DEVICES"] = normalized_gpu_device_id
+            elif request.gpu_device_id not in (None, ""):
+                task.add_log(
+                    f"[WARN] Ignored invalid gpu_device_id: {request.gpu_device_id}"
+                )
 
             # 使用进程组启动，确保 cancel 时子进程一起销毁
             if sys.platform != 'win32':
@@ -773,42 +932,58 @@ class TranslationWorker:
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 )
 
-            task._process = process
+            task.set_process(process)
 
-            # 实时读取输出
+            # 实时读取输出（带短超时，避免静默场景下无法响应取消）
+            read_timeout_s = 0.2
             while True:
-                line = await process.stdout.readline()
-                if not line:
-                    break
-
-                line_text = line.decode('utf-8', errors='ignore').strip()
-                if line_text:
-                    # Skip think-stream deltas to avoid log flooding in remote mode
-                    if line_text.startswith("JSON_THINK_DELTA:"):
-                        continue
-                    task.add_log(line_text)
-
-                    # 解析进度
-                    if "PROGRESS:" in line_text:
-                        try:
-                            progress_json = line_text.split("PROGRESS:")[-1]
-                            progress_data = json.loads(progress_json)
-                            task.current_block = progress_data.get("current", 0)
-                            task.total_blocks = progress_data.get("total", 0)
-                            if task.total_blocks > 0:
-                                task.progress = task.current_block / task.total_blocks
-                        except:
-                            pass
-
-                # 检查取消请求
-                if task.cancel_requested:
+                # 优先检查取消，避免阻塞在 readline() 导致取消延迟
+                if task.is_cancel_requested():
                     await self._kill_process_tree(process)
-                    task.status = TaskStatus.CANCELLED
+                    task.set_status(TaskStatus.CANCELLED)
                     task.add_log("[WARN] Translation cancelled by user")
                     return ""
 
+                try:
+                    line = await asyncio.wait_for(
+                        process.stdout.readline(),
+                        timeout=read_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    # 无输出时定期回到循环顶端检查取消。
+                    if process.returncode is not None:
+                        break
+                    continue
+
+                if not line:
+                    if process.returncode is not None:
+                        break
+                    continue
+
+                line_text = line.decode('utf-8', errors='ignore').strip()
+                if not line_text:
+                    continue
+                # Skip think-stream deltas to avoid log flooding in remote mode
+                if line_text.startswith("JSON_THINK_DELTA:"):
+                    continue
+                task.add_log(line_text)
+
+                # 解析进度
+                if "PROGRESS:" in line_text:
+                    try:
+                        progress_json = line_text.split("PROGRESS:")[-1]
+                        progress_data = json.loads(progress_json)
+                        current_block = progress_data.get("current", 0)
+                        total_blocks = progress_data.get("total", 0)
+                        progress = 0.0
+                        if total_blocks > 0:
+                            progress = current_block / total_blocks
+                        task.set_progress(progress, current_block, total_blocks)
+                    except:
+                        pass
+
             await process.wait()
-            task._process = None
+            task.set_process(None)
 
             # 读取结果
             if process.returncode == 0 and output_path.exists():
@@ -878,13 +1053,13 @@ if __name__ == "__main__":
             chunk_size = 1000
             ctx = 8192
             gpu_layers = -1
-            temperature = 0.7
+            temperature = 0.3
             line_format = "single"
             strict_mode = "off"
             line_check = False
             line_tolerance_abs = 10
             line_tolerance_pct = 0.2
-            anchor_check = True
+            anchor_check = False
             anchor_check_retries = 1
             traditional = False
             save_cot = False

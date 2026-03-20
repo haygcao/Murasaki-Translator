@@ -1,4 +1,4 @@
-import {
+﻿import {
   app,
   shell,
   BrowserWindow,
@@ -7,8 +7,9 @@ import {
   Notification,
   nativeTheme,
   session,
+  clipboard,
 } from "electron";
-import type { IpcMainEvent as ElectronEvent } from "electron";
+import type { IpcMainEvent, IpcMainInvokeEvent } from "electron";
 import {
   join,
   basename,
@@ -24,6 +25,7 @@ import { spawn, ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
 import fs from "fs";
 import { ServerManager } from "./serverManager";
+import { normalizeCudaVisibleDevices } from "./gpuDeviceId";
 import { getLlamaServerPath, detectPlatform } from "./platform";
 import { TranslateOptions } from "./remoteClient";
 import {
@@ -33,25 +35,122 @@ import {
 import { stopPipelineV2Server } from "./pipelineV2Server";
 import {
   registerPipelineV2Runner,
+  isPipelineV2RunnerBusy,
   stopPipelineV2Runner,
 } from "./pipelineV2Runner";
 import { createApiStatsService } from "./apiStatsStore";
+import { formatScanDirectoryFailure } from "./ipcDiagnostics";
+import { resolveRemoteOutputPrecheck } from "./remoteOutputPrecheck";
+import { resolveProfilesDirWithLegacyFallback } from "./profileDirMigration";
 
 let pythonProcess: ChildProcess | null = null;
+let translationStartInProgress = false;
 let translationStopRequested = false;
 let activeRunId: string | null = null;
 let remoteTranslationBridge: {
   client: any;
   taskId: string;
   cancelRequested: boolean;
+  runId?: string;
 } | null = null;
 let mainWindow: BrowserWindow | null = null;
 let hardwareSpecsInFlight: Promise<any> | null = null;
+let hardwareSpecsProcess: ChildProcess | null = null;
 let hardwareSpecsCache: {
   at: number;
   data: any;
 } | null = null;
 const HARDWARE_SPECS_CACHE_TTL_MS = 12000;
+const ADVANCED_VIEW_RECOVERY_FILE = join(
+  app.getPath("userData"),
+  "advanced-view-recovery.json",
+);
+
+interface AdvancedViewRecoveryState {
+  enabled: boolean;
+  pendingRelaunch: boolean;
+  updatedAt: number;
+  trigger?: string;
+}
+
+const readAdvancedViewRecoveryState = (): AdvancedViewRecoveryState | null => {
+  try {
+    if (!fs.existsSync(ADVANCED_VIEW_RECOVERY_FILE)) {
+      return null;
+    }
+    const raw = fs.readFileSync(ADVANCED_VIEW_RECOVERY_FILE, "utf8");
+    const parsed = JSON.parse(raw) as Partial<AdvancedViewRecoveryState>;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return {
+      enabled: parsed.enabled === true,
+      pendingRelaunch: parsed.pendingRelaunch === true,
+      updatedAt:
+        typeof parsed.updatedAt === "number" ? parsed.updatedAt : Date.now(),
+      trigger:
+        typeof parsed.trigger === "string" ? parsed.trigger : undefined,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const writeAdvancedViewRecoveryState = (
+  state: AdvancedViewRecoveryState | null,
+): void => {
+  try {
+    if (!state) {
+      if (fs.existsSync(ADVANCED_VIEW_RECOVERY_FILE)) {
+        fs.unlinkSync(ADVANCED_VIEW_RECOVERY_FILE);
+      }
+      return;
+    }
+    fs.mkdirSync(dirname(ADVANCED_VIEW_RECOVERY_FILE), { recursive: true });
+    fs.writeFileSync(
+      ADVANCED_VIEW_RECOVERY_FILE,
+      JSON.stringify(state, null, 2),
+      "utf8",
+    );
+  } catch (error) {
+    console.warn("[AdvancedViewRecovery] Failed to persist state:", error);
+  }
+};
+
+const initialAdvancedViewRecoveryState = readAdvancedViewRecoveryState();
+if (initialAdvancedViewRecoveryState?.enabled) {
+  app.disableHardwareAcceleration();
+}
+
+let lastRendererView = "dashboard";
+
+const scheduleAdvancedViewRecoveryRelaunch = (
+  trigger: string,
+  details?: Record<string, unknown>,
+) => {
+  if (shutdownInProgress || lastRendererView !== "advanced") {
+    return;
+  }
+  const current = readAdvancedViewRecoveryState();
+  if (current?.enabled) {
+    return;
+  }
+  const nextState: AdvancedViewRecoveryState = {
+    enabled: true,
+    pendingRelaunch: true,
+    updatedAt: Date.now(),
+    trigger,
+  };
+  writeAdvancedViewRecoveryState(nextState);
+  console.error("[AdvancedViewRecovery] Enabling GPU-safe relaunch", {
+    trigger,
+    lastRendererView,
+    ...(details || {}),
+  });
+  app.relaunch();
+  app.exit(0);
+};
+
 let envCheckInFlight: Promise<
   | { ok: true; report: any }
   | { ok: false; error: string; output?: string; errorOutput?: string }
@@ -78,7 +177,7 @@ type WatchFolderEntry = {
 
 const watchFolderEntries = new Map<string, WatchFolderEntry>();
 
-// 主进程日志缓冲区 - 用于调试工具箱查看完整终端日志
+// 主进程日志缓冲区，用于在调试工具中查看完整终端日志。
 const mainProcessLogs: string[] = [];
 const MAX_MAIN_LOGS = 1000;
 
@@ -94,6 +193,7 @@ type LogMeta = {
   runId?: string | null;
   taskId?: string | null;
 };
+type LogReplyEvent = IpcMainEvent | IpcMainInvokeEvent;
 
 const normalizeLogLines = (message: string): string[] =>
   message
@@ -181,22 +281,30 @@ const emitJsonLog = (
   send(`${prefix}${JSON.stringify(enriched)}\n`);
 };
 
+const sendEventLogUpdate = (event: LogReplyEvent, payload: string): void => {
+  if ("reply" in event && typeof event.reply === "function") {
+    event.reply("log-update", payload);
+    return;
+  }
+  event.sender.send("log-update", payload);
+};
+
 const replyLogUpdate = (
-  event: ElectronEvent,
+  event: LogReplyEvent,
   message: string,
   meta: LogMeta = {},
 ) => {
-  emitLogUpdate((payload) => event.reply("log-update", payload), message, meta);
+  emitLogUpdate((payload) => sendEventLogUpdate(event, payload), message, meta);
 };
 
 const replyJsonLog = (
-  event: ElectronEvent,
+  event: LogReplyEvent,
   prefix: string,
   payload: Record<string, unknown>,
   meta: LogMeta = {},
 ) => {
   emitJsonLog(
-    (payloadLine) => event.reply("log-update", payloadLine),
+    (payloadLine) => sendEventLogUpdate(event, payloadLine),
     prefix,
     payload,
     meta,
@@ -216,6 +324,18 @@ const sendLogUpdateToWindow = (
   );
 };
 
+const normalizeRunId = (runId: unknown): string | undefined => {
+  const normalized = typeof runId === "string" ? runId.trim() : "";
+  return normalized || undefined;
+};
+
+const clearActiveRunIfMatch = (runId?: string): void => {
+  if (!runId) return;
+  if (activeRunId === runId) {
+    activeRunId = null;
+  }
+};
+
 const requestRemoteTaskCancel = (reason?: string): boolean => {
   if (!remoteTranslationBridge) return false;
   translationStopRequested = true;
@@ -233,6 +353,7 @@ const requestRemoteTaskCancel = (reason?: string): boolean => {
     },
   );
   const cancellingTaskId = bridge.taskId;
+  const cancellingRunId = normalizeRunId(bridge.runId) || normalizeRunId(activeRunId);
   setTimeout(() => {
     if (
       remoteTranslationBridge &&
@@ -247,8 +368,9 @@ const requestRemoteTaskCancel = (reason?: string): boolean => {
         code: 1,
         signal: null,
         stopRequested: true,
-        runId: activeRunId || undefined,
+        runId: cancellingRunId,
       });
+      clearActiveRunIfMatch(cancellingRunId);
     }
   }, 8000);
   void bridge.client.cancelTask(bridge.taskId).catch((error: unknown) => {
@@ -264,6 +386,76 @@ const requestRemoteTaskCancel = (reason?: string): boolean => {
     );
   });
   return true;
+};
+
+const terminateChildProcessTree = (
+  targetProcess: ChildProcess | null,
+  logPrefix: string,
+) => {
+  if (!targetProcess) return;
+  const pid = targetProcess.pid;
+
+  if (process.platform === "win32" && pid) {
+    const killProc = spawn("taskkill", ["/pid", pid.toString(), "/f", "/t"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killProc.on("error", (err) => {
+      console.error(`${logPrefix} taskkill spawn error:`, err.message);
+      try {
+        targetProcess.kill("SIGKILL");
+      } catch {
+        // ignore fallback kill failure
+      }
+    });
+    return;
+  }
+
+  try {
+    targetProcess.kill("SIGKILL");
+  } catch {
+    // ignore best-effort kill failure
+  }
+};
+
+const requestStopForLocalTranslationProcess = (targetProcess: ChildProcess) => {
+  translationStopRequested = true;
+  const pid = targetProcess.pid;
+  console.log(`[Stop] Stopping translation process with PID: ${pid}`);
+
+  if (process.platform === "win32" && pid) {
+    console.log(`[Stop] Executing async: taskkill /pid ${pid} /f /t`);
+    const killProc = spawn("taskkill", ["/pid", pid.toString(), "/f", "/t"], {
+      stdio: "pipe",
+      windowsHide: true,
+    });
+    killProc.on("close", (code) => {
+      console.log(`[Stop] taskkill exited with code ${code}`);
+    });
+    killProc.on("error", (err) => {
+      console.error("[Stop] taskkill spawn error:", err.message);
+      // Fallback
+      try {
+        targetProcess.kill();
+      } catch {
+        // ignore fallback kill failure
+      }
+    });
+    // 超时兜底：3s 后若进程仍然存活。
+    setTimeout(() => {
+      try {
+        if (pythonProcess === targetProcess) {
+          targetProcess.kill("SIGKILL");
+        }
+      } catch {
+        // ignore force-kill failure
+      }
+    }, 3000);
+  } else {
+    targetProcess.kill();
+  }
+
+  console.log("[Stop] Translation process stopped signal sent");
 };
 
 const safeStringify = (value: unknown): string => {
@@ -371,25 +563,46 @@ function createWindow(): void {
       event.preventDefault();
     }
   });
+
+  // Capture renderer/gpu process failures for post-mortem diagnosis.
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    console.error("[RendererGone]", {
+      reason: details.reason,
+      exitCode: details.exitCode,
+    });
+    scheduleAdvancedViewRecoveryRelaunch("render-process-gone", {
+      reason: details.reason,
+      exitCode: details.exitCode,
+    });
+  });
+  mainWindow.webContents.on("unresponsive", () => {
+    console.warn("[RendererUnresponsive] window became unresponsive");
+  });
 }
 
 /**
- * 清理所有子进程
+ * 清理所有子进程。
  */
 async function cleanupProcesses(): Promise<void> {
   console.log("[App] Cleaning up processes...");
 
-  // 停止翻译进程
+  // 停止翻译进程。
   if (pythonProcess) {
     try {
-      pythonProcess.kill();
-      if (process.platform === "win32" && pythonProcess.pid) {
-        spawn("taskkill", ["/pid", pythonProcess.pid.toString(), "/f", "/t"]);
-      }
+      terminateChildProcessTree(pythonProcess, "[App]");
     } catch (e) {
       console.error("[App] Error killing python process:", e);
     }
     pythonProcess = null;
+  }
+
+  if (hardwareSpecsProcess) {
+    try {
+      terminateChildProcessTree(hardwareSpecsProcess, "[App][HardwareSpecs]");
+    } catch (e) {
+      console.error("[App] Error killing hardware specs process:", e);
+    }
+    hardwareSpecsProcess = null;
   }
 
   try {
@@ -404,7 +617,7 @@ async function cleanupProcesses(): Promise<void> {
     console.error("[App] Error stopping pipeline v2 server:", e);
   }
 
-  // 停止 ServerManager 管理的 llama-server
+  // 鍋滄 ServerManager 绠＄悊鐨?llama-server
   try {
     await ServerManager.getInstance().stop();
   } catch (e) {
@@ -417,11 +630,30 @@ async function cleanupProcesses(): Promise<void> {
     void bridge.client.cancelTask(bridge.taskId).catch(() => undefined);
   }
 
+  if (remoteEventLogFlushTimer) {
+    clearTimeout(remoteEventLogFlushTimer);
+    remoteEventLogFlushTimer = null;
+  }
+  if (remoteMirrorLogFlushTimer) {
+    clearTimeout(remoteMirrorLogFlushTimer);
+    remoteMirrorLogFlushTimer = null;
+  }
+  try {
+    await flushRemoteEventLog();
+  } catch (e) {
+    console.warn("[App] Error flushing remote event log:", e);
+  }
+  try {
+    await flushRemoteMirrorLog();
+  } catch (e) {
+    console.warn("[App] Error flushing remote mirror log:", e);
+  }
+
   await closeAllWatchFolders();
 }
 
 /**
- * 清理临时文件目录（启动时调用，防止残留）
+ * 清理临时目录（启动时执行，避免残留）。
  */
 function cleanupTempDirectory(): void {
   try {
@@ -431,7 +663,9 @@ function cleanupTempDirectory(): void {
       for (const file of files) {
         try {
           fs.unlinkSync(join(tempDir, file));
-        } catch (_) {}
+        } catch {
+          // ignore temp cleanup failure
+        }
       }
       console.log(`[App] Cleaned ${files.length} temp files`);
     }
@@ -452,7 +686,9 @@ function cleanupTempDirectory(): void {
           continue;
         try {
           fs.unlinkSync(join(middlewareDir, file));
-        } catch {}
+        } catch {
+          // ignore legacy temp cleanup failure
+        }
       }
     }
   } catch (e) {
@@ -460,14 +696,14 @@ function cleanupTempDirectory(): void {
   }
 }
 
-// macOS GPU 监控 sudo 配置
+// macOS GPU 鐩戞帶 sudo 閰嶇疆
 async function setupMacOSGPUMonitoring(): Promise<void> {
   if (process.platform !== "darwin") return;
 
   try {
     const { execSync, exec } = require("child_process");
 
-    // 检查是否已配置免密 sudo
+    // 检查是否已配置免密 sudo。
     try {
       execSync("sudo -n powermetrics --help", {
         timeout: 2000,
@@ -481,7 +717,7 @@ async function setupMacOSGPUMonitoring(): Promise<void> {
       );
     }
 
-    // 使用 osascript 弹出 macOS 原生授权对话框
+    // 浣跨敤 osascript 寮瑰嚭 macOS 鍘熺敓鎺堟潈瀵硅瘽妗?
     const username = require("os").userInfo().username;
     const sudoersContent = `${username} ALL=(ALL) NOPASSWD: /usr/bin/powermetrics`;
     const command = `osascript -e 'do shell script "mkdir -p /etc/sudoers.d && echo \\"${sudoersContent}\\" > /etc/sudoers.d/murasaki-powermetrics && chmod 0440 /etc/sudoers.d/murasaki-powermetrics" with administrator privileges'`;
@@ -502,6 +738,15 @@ async function setupMacOSGPUMonitoring(): Promise<void> {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
+  const activeRecoveryState = readAdvancedViewRecoveryState();
+  if (activeRecoveryState?.enabled && activeRecoveryState.pendingRelaunch) {
+    writeAdvancedViewRecoveryState({
+      ...activeRecoveryState,
+      pendingRelaunch: false,
+      updatedAt: Date.now(),
+    });
+  }
+
   // Clean up any residual temp files from crashed sessions
   cleanupTempDirectory();
 
@@ -528,28 +773,50 @@ app.whenReady().then(() => {
   );
 
   createWindow();
+  ipcMain.on("renderer-active-view", (_event, view: string) => {
+    lastRendererView = typeof view === "string" ? view : "unknown";
+  });
+  app.on("child-process-gone", (_event, details) => {
+    if (details.type === "GPU") {
+      console.error("[GpuProcessGone]", {
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+      scheduleAdvancedViewRecoveryRelaunch("gpu-process-gone", {
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+      return;
+    }
+    console.warn("[ChildProcessGone]", {
+      type: details.type,
+      serviceName: details.serviceName,
+      reason: details.reason,
+      exitCode: details.exitCode,
+    });
+  });
   const resolveProfilesDir = () => {
     const envDir =
       process.env.MURASAKI_PROFILES_DIR || process.env.PIPELINE_V2_PROFILES_DIR;
     if (envDir && envDir.trim()) return resolve(envDir.trim());
-    return getPipelineV2ProfilesDir();
+    return getPipelineV2ProfilesDir(getMiddlewarePath());
   };
   const profilesDir = resolveProfilesDir();
+  let hasWarnedLegacyProfilesFallback = false;
   const ensureProfilesDir = () => {
-    const legacyDir = join(getMiddlewarePath(), "pipeline_v2_profiles");
-    if (
-      legacyDir !== profilesDir &&
-      fs.existsSync(legacyDir) &&
-      !fs.existsSync(profilesDir)
-    ) {
-      try {
-        fs.mkdirSync(profilesDir, { recursive: true });
-        fs.cpSync(legacyDir, profilesDir, { recursive: true });
-      } catch (error) {
-        console.warn("[App] Profiles migration skipped:", error);
-      }
+    const legacyDir = getPipelineV2ProfilesDir(app.getPath("userData"));
+    const resolved = resolveProfilesDirWithLegacyFallback({
+      profilesDir,
+      legacyDir,
+      fsLike: fs,
+    });
+    if (resolved.usedLegacyFallback && !hasWarnedLegacyProfilesFallback) {
+      hasWarnedLegacyProfilesFallback = true;
+      console.warn(
+        "[App] Profiles migration deferred: fallback to user-data profiles directory.",
+      );
     }
-    return profilesDir;
+    return resolved.activeDir;
   };
   const apiStatsService = createApiStatsService({
     getProfilesDir: ensureProfilesDir,
@@ -567,6 +834,10 @@ app.whenReady().then(() => {
     getPythonPath,
     getMiddlewarePath,
     getMainWindow: () => mainWindow,
+    isTranslationBusy: () =>
+      Boolean(
+        pythonProcess || remoteTranslationBridge || translationStartInProgress,
+      ),
     recordApiStatsEvent: (event) => {
       void apiStatsService.appendEvent(event);
     },
@@ -580,7 +851,7 @@ app.whenReady().then(() => {
     },
   });
 
-  // macOS: 配置 GPU 监控 sudo（在窗口创建后）
+  // macOS: 在窗口创建后配置 GPU 监控 sudo。
   setupMacOSGPUMonitoring();
 
   app.on("activate", function () {
@@ -590,7 +861,7 @@ app.whenReady().then(() => {
   });
 });
 
-// 应用退出前清理资源
+// 搴旂敤閫€鍑哄墠娓呯悊璧勬簮
 let shutdownInProgress = false;
 const handleAppShutdown = async (): Promise<void> => {
   if (shutdownInProgress) return;
@@ -724,6 +995,20 @@ const getScriptPythonInfo = (): { type: "python"; path: string } => ({
   path: getScriptPythonPath(),
 });
 
+const formatSystemCommandForLog = (
+  pythonInfo: { type: "python" | "bundle"; path: string },
+  args: string[],
+): string => {
+  const rawCmd = String(pythonInfo?.path ?? "").trim();
+  // Defensive cleanup: avoid leaking object stringification into logs.
+  const cleanedCmd = rawCmd.replace(/\[object Object\]/g, "").trim();
+  const cmd = cleanedCmd || "python";
+  return [cmd, ...args]
+    .map((part) => String(part ?? "").trim())
+    .filter(Boolean)
+    .join(" ");
+};
+
 const tryParseJson = <T = any>(raw: string): T | null => {
   try {
     return JSON.parse(raw) as T;
@@ -837,10 +1122,10 @@ const spawnPythonProcess = (
 
   if (pythonInfo.type === "bundle") {
     // Bundle mode: directly execute the bundle with args
-    // PyInstaller bundle 内置入口点，需要移除脚本路径
+    // PyInstaller bundle 内置入口，需要移除脚本路径参数。
     // args = ['path/to/main.py', '--file', ...] -> ['--file', ...]
     cmd = pythonInfo.path;
-    // 移除脚本路径，仅保留实际参数
+    // 移除脚本路径，仅保留实际参数。
     finalArgs = args.slice(1);
     console.log(`[Spawn Bundle] ${cmd} ${finalArgs.join(" ")}`);
   } else {
@@ -861,7 +1146,7 @@ const spawnPythonProcess = (
         ...finalArgs,
       ];
       console.log(
-        `[Spawn Python] debugpy enabled – waiting for debugger on port ${debugPort}`,
+        `[Spawn Python] debugpy enabled 鈥?waiting for debugger on port ${debugPort}`,
       );
     }
 
@@ -911,6 +1196,51 @@ const ensureDirExists = async (targetPath: string) => {
   if (dirPath === root || dirPath === `${root}`) return;
   if (fs.existsSync(dirPath)) return;
   await fs.promises.mkdir(dirPath, { recursive: true });
+};
+
+const HISTORY_DETAIL_CACHE_DIR = "history_details";
+
+type HistoryDetailPayload = {
+  logs: string[];
+  triggers: Record<string, unknown>[];
+  llamaLogs: string[];
+};
+
+const normalizeHistoryDetailPayload = (raw: unknown): HistoryDetailPayload => {
+  const detail =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  const normalizeLines = (value: unknown) =>
+    Array.isArray(value) ? value.map((line) => String(line ?? "")) : [];
+  const normalizeTriggers = (value: unknown) =>
+    Array.isArray(value)
+      ? value
+          .filter((item) => item && typeof item === "object")
+          .map((item) => item as Record<string, unknown>)
+      : [];
+  return {
+    logs: normalizeLines(detail.logs),
+    triggers: normalizeTriggers(detail.triggers),
+    llamaLogs: normalizeLines(detail.llamaLogs),
+  };
+};
+
+const sanitizeHistoryDetailId = (id: string): string => {
+  const normalized = String(id || "").trim();
+  if (!normalized) {
+    throw new Error("History detail id is required");
+  }
+  return normalized.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160);
+};
+
+const getHistoryDetailCacheDir = (): string => {
+  return ensurePathWithinUserData(join(getUserDataPath(), HISTORY_DETAIL_CACHE_DIR));
+};
+
+const getHistoryDetailCacheFilePath = (id: string): string => {
+  const safeId = sanitizeHistoryDetailId(id);
+  return ensurePathWithinUserData(join(getHistoryDetailCacheDir(), `${safeId}.json`));
 };
 
 const normalizeWatchFileTypes = (types: string[]) =>
@@ -1027,7 +1357,7 @@ ipcMain.handle(
       defaultPath: options?.defaultPath,
       properties: ["openFile"],
       filters: options?.filters || [
-        { name: "Documents", extensions: ["txt", "epub", "srt", "ass", "ssa"] },
+        { name: "Documents", extensions: ["txt", "epub", "srt", "ass", "ssa", "xlsx"] },
       ],
     });
     if (canceled) return null;
@@ -1053,7 +1383,7 @@ ipcMain.handle("select-files", async () => {
   const { canceled, filePaths } = await dialog.showOpenDialog({
     properties: ["openFile", "multiSelections"],
     filters: [
-      { name: "Documents", extensions: ["txt", "epub", "srt", "ass", "ssa"] },
+      { name: "Documents", extensions: ["txt", "epub", "srt", "ass", "ssa", "xlsx"] },
     ],
   });
   if (canceled) return [];
@@ -1114,7 +1444,7 @@ import {
 
 let remoteClient: RemoteClient | null = null;
 const REMOTE_NOTICE =
-  "远程模式已启用：所有交互都会直接发送到服务器，并同步镜像保存到本地。";
+  "i18n:remoteRuntime.noticeModeEnabled";
 const REMOTE_SYNC_ROOT = join(getUserDataPath(), "remote-sync");
 const REMOTE_SYNC_MIRROR_PATH = join(REMOTE_SYNC_ROOT, "sync-mirror.log");
 const REMOTE_EVENT_LOG_PATH = join(REMOTE_SYNC_ROOT, "network-events.log");
@@ -1420,30 +1750,34 @@ const buildRemoteActionHint = (params: {
   const hints: string[] = [];
   switch (params.code) {
     case "REMOTE_UNAUTHORIZED":
-      hints.push("请确认 API Key 是否正确，且服务端已启用鉴权。");
+      hints.push("i18n:remoteRuntime.hintUnauthorized");
       break;
     case "REMOTE_NOT_FOUND":
-      hints.push("请确认远程地址是否正确（通常为 http(s)://host:port）。");
+      hints.push("i18n:remoteRuntime.hintNotFound");
       break;
     case "REMOTE_TIMEOUT":
-      hints.push("请求超时，建议检查服务器负载或稍后重试。");
+      hints.push("i18n:remoteRuntime.hintTimeout");
       break;
     case "REMOTE_NETWORK":
-      hints.push("网络不可达，请检查网络/防火墙/代理与服务端在线状态。");
+      hints.push("i18n:remoteRuntime.hintNetwork");
       break;
     case "REMOTE_PROTOCOL":
-      hints.push("连接未就绪，请先在服务页测试远程连接。");
+      hints.push("i18n:remoteRuntime.hintProtocol");
       break;
     default:
       break;
   }
 
   if (remoteNetworkStats.lastError?.message) {
-    hints.push(`最近网络错误：${remoteNetworkStats.lastError.message}`);
+    hints.push(
+      `i18n:remoteRuntime.hintLatestNetworkError|${encodeURIComponent(
+        remoteNetworkStats.lastError.message,
+      )}`,
+    );
   }
 
-  hints.push("可在服务管理 → 远程运行详情 打开网络日志/任务镜像日志排查。");
-  return hints.join(" ");
+  hints.push("i18n:remoteRuntime.hintOpenDetails");
+  return hints.join("\n");
 };
 
 const formatRemoteError = (error: unknown) => {
@@ -1881,7 +2215,7 @@ ipcMain.handle("select-folder-files", async () => {
   const folderPath = filePaths[0];
   const files = fs
     .readdirSync(folderPath)
-    .filter((f) => /\.(txt|epub|srt|ass|ssa)$/i.test(f))
+    .filter((f) => /\.(txt|epub|srt|ass|ssa|xlsx)$/i.test(f))
     .map((f) => join(folderPath, f));
   return files;
 });
@@ -1906,7 +2240,7 @@ const scanDirectoryAsync = async (
       if (entry.isSymbolicLink()) continue;
 
       if (entry.isFile()) {
-        if (/\.(txt|epub|srt|ass|ssa)$/i.test(fullPath)) {
+        if (/\.(txt|epub|srt|ass|ssa|xlsx)$/i.test(fullPath)) {
           results.push(fullPath);
         }
       } else if (entry.isDirectory() && recursive) {
@@ -1932,14 +2266,14 @@ const scanDirectoryAsync = async (
 
     return results;
   } catch (e) {
-    // console.error('Scan dir error:', dir, e)
+    console.warn("[IPC]", formatScanDirectoryFailure(dir, e));
     return [];
   }
 };
 
 ipcMain.handle(
   "scan-directory",
-  async (_event, path: string, recursive: boolean = false) => {
+  async (event, path: string, recursive: boolean = false) => {
     try {
       if (!fs.existsSync(path)) return [];
 
@@ -1948,7 +2282,7 @@ ipcMain.handle(
 
       // If it's a file, return if supported
       if (stats.isFile()) {
-        return /\.(txt|epub|srt|ass|ssa)$/i.test(path) ? [path] : [];
+        return /\.(txt|epub|srt|ass|ssa|xlsx)$/i.test(path) ? [path] : [];
       }
 
       // If directory
@@ -1957,7 +2291,12 @@ ipcMain.handle(
       }
       return [];
     } catch (e) {
+      const message = formatScanDirectoryFailure(path, e);
       console.error("[IPC] scan-directory error:", e);
+      replyLogUpdate(event, `WARN: ${message}`, {
+        level: "warn",
+        source: "main",
+      });
       return [];
     }
   },
@@ -2108,7 +2447,7 @@ ipcMain.handle("check-update", async () => {
 
 // --- Main Process Logs IPC ---
 ipcMain.handle("get-main-process-logs", () => {
-  return mainProcessLogs.slice(); // 返回副本
+  return mainProcessLogs.slice(); // 杩斿洖鍓湰
 });
 
 // --- System Diagnostics IPC ---
@@ -2156,7 +2495,7 @@ ipcMain.handle("get-system-diagnostics", async () => {
     return `"${value.replace(/"/g, '\\"')}"`;
   };
 
-  // 辅助函数：带超时的异步执行
+  // 辅助函数：带超时的异步执行。
   const execWithTimeout = async (
     cmd: string,
     timeout: number,
@@ -2206,6 +2545,30 @@ ipcMain.handle("get-system-diagnostics", async () => {
     return match ? match[1] : null;
   };
 
+  const parseVulkanDetails = (
+    output: string,
+  ): { version?: string; devices?: string[] } => {
+    const versionMatch = output.match(
+      /Vulkan Instance Version:\s*(\d+\.\d+\.\d+)/i,
+    );
+    const version = versionMatch ? versionMatch[1] : undefined;
+    const devices = Array.from(
+      new Set(
+        output
+          .split(/\r?\n/)
+          .map((line: string) => {
+            const match = line.match(/GPU\s*\d+\s*:\s*(.+)$/i);
+            return match ? match[1].trim() : "";
+          })
+          .filter((line: string) => Boolean(line)),
+      ),
+    );
+    return {
+      version,
+      devices: devices.length > 0 ? devices : undefined,
+    };
+  };
+
   // GPU Detection (NVIDIA) - parallel execution
   const gpuPromise = (async () => {
     try {
@@ -2237,7 +2600,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
           }
         }
       }
-    } catch {}
+    } catch {
+      // ignore nvidia-smi xml fallback failure
+    }
 
     try {
       const { stdout } = await execWithTimeout(
@@ -2259,7 +2624,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
           return;
         }
       }
-    } catch {}
+    } catch {
+      // ignore nvidia-smi csv fallback failure
+    }
 
     if (process.platform === "win32") {
       try {
@@ -2285,7 +2652,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
           result.gpu = { name, driver: driver || undefined, vram };
           return;
         }
-      } catch {}
+      } catch {
+        // ignore wmic gpu detection failure
+      }
 
       try {
         const { stdout } = await execWithTimeout(
@@ -2310,7 +2679,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
           result.gpu = { name, driver: driver || undefined, vram };
           return;
         }
-      } catch {}
+      } catch {
+        // ignore powershell gpu detection failure
+      }
     }
 
     if (process.platform === "darwin") {
@@ -2335,7 +2706,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
           result.gpu = { name: String(name), driver: "METAL", vram };
           return;
         }
-      } catch {}
+      } catch {
+        // ignore macOS gpu detection failure
+      }
     }
 
     if (process.platform === "linux") {
@@ -2359,7 +2732,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
             return;
           }
         }
-      } catch {}
+      } catch {
+        // ignore linux nvidia-smi detection failure
+      }
 
       try {
         const { stdout } = await execWithTimeout("lspci", 4000);
@@ -2373,7 +2748,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
           };
           return;
         }
-      } catch {}
+      } catch {
+        // ignore lspci detection failure
+      }
 
       try {
         const { stdout } = await execWithTimeout("glxinfo -B", 4000);
@@ -2386,7 +2763,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
             driver: "Detected via glxinfo",
           };
         }
-      } catch {}
+      } catch {
+        // ignore glxinfo detection failure
+      }
     }
   })();
 
@@ -2416,7 +2795,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
           result.python = { version, path: executable };
           return;
         }
-      } catch {}
+      } catch {
+        // ignore python candidate probing failure
+      }
     }
 
     if (primary.type === "bundle" && fs.existsSync(primary.path)) {
@@ -2449,7 +2830,9 @@ ipcMain.handle("get-system-diagnostics", async () => {
           result.cuda = { version: `driver ${first}`, available: true };
           return;
         }
-      } catch {}
+      } catch {
+        // ignore cuda fallback probe failure
+      }
       result.cuda = { version: "N/A", available: false };
     }
   })();
@@ -2462,29 +2845,31 @@ ipcMain.handle("get-system-diagnostics", async () => {
         5000,
       );
       const output = `${stdout}\n${stderr}`;
-      const versionMatch = output.match(
-        /Vulkan Instance Version:\s*(\d+\.\d+\.\d+)/i,
-      );
-      const version = versionMatch ? versionMatch[1] : undefined;
-      result.vulkan = { available: true, version };
+      const details = parseVulkanDetails(output);
+      result.vulkan = {
+        available: true,
+        version: details.version,
+        devices: details.devices,
+      };
     } catch {
       try {
         const { stdout, stderr } = await execWithTimeout("vulkaninfo", 5000);
         const output = `${stdout}\n${stderr}`;
-        const versionMatch = output.match(
-          /Vulkan Instance Version:\s*(\d+\.\d+\.\d+)/i,
-        );
+        const details = parseVulkanDetails(output);
         result.vulkan = {
           available: true,
-          version: versionMatch ? versionMatch[1] : undefined,
+          version: details.version,
+          devices: details.devices,
         };
         return;
-      } catch {}
+      } catch {
+        // ignore vulkan fallback probe failure
+      }
       result.vulkan = { available: false };
     }
   })();
 
-  // 并行等待所有检测完成
+  // 并行等待所有检测完成。
   await Promise.all([gpuPromise, pythonPromise, cudaPromise, vulkanPromise]);
 
   // llama-server Status Check (Use ServerManager's actual port)
@@ -2623,7 +3008,9 @@ ipcMain.handle(
           start: startPos,
         });
 
-        stream.on("data", (chunk: string) => chunks.push(chunk));
+        stream.on("data", (chunk: string | Buffer) =>
+          chunks.push(typeof chunk === "string" ? chunk : chunk.toString("utf-8")),
+        );
         stream.on("end", () => {
           const content = chunks.join("");
           const lines = content.split("\n").slice(1);
@@ -2655,10 +3042,10 @@ ipcMain.handle("read-server-log", async () => {
     }
 
     const stats = fs.statSync(logPath);
-    const maxBytes = 512 * 1024; // 最多读取 512KB（约 10000 行）
+    const maxBytes = 512 * 1024; // 鏈€澶氳鍙?512KB锛堢害 10000 琛岋級
     const lineCount = 500;
 
-    // 如果文件较小，直接读取
+    // 小文件直接读取。
     if (stats.size <= maxBytes) {
       const content = fs.readFileSync(logPath, "utf-8");
       const lines = content.split("\n");
@@ -2670,7 +3057,7 @@ ipcMain.handle("read-server-log", async () => {
       };
     }
 
-    // 大文件：仅读取末尾部分
+    // 大文件仅读取末尾片段。
     return new Promise((resolve) => {
       const chunks: string[] = [];
       const startPos = Math.max(0, stats.size - maxBytes);
@@ -2679,10 +3066,12 @@ ipcMain.handle("read-server-log", async () => {
         start: startPos,
       });
 
-      stream.on("data", (chunk: string) => chunks.push(chunk));
+      stream.on("data", (chunk: string | Buffer) =>
+        chunks.push(typeof chunk === "string" ? chunk : chunk.toString("utf-8")),
+      );
       stream.on("end", () => {
         const content = chunks.join("");
-        // 跳过第一行（可能是不完整行）
+        // 跳过第一行（可能是不完整行）。
         const lines = content.split("\n").slice(1);
         resolve({
           exists: true,
@@ -2835,7 +3224,7 @@ ipcMain.handle("get-model-info", async (_event, modelName: string) => {
   const paramsB = paramsMatch ? parseFloat(paramsMatch[1]) : null;
 
   // Extract quant (e.g., IQ4_XS, IQ3_M, Q4_K_M, Q5_K, Q8_0, F16)
-  // 优先匹配 IQ 系列，再匹配 Q 系列
+  // 优先匹配 IQ 系列，再匹配 Q 系列。
   const quantMatch = modelName.match(
     /IQ[1-4]_?(XXS|XS|S|M|NL)|Q[2-8]_?[Kk]?_?[MmSsLl]?|[Ff]16|BF16/i,
   );
@@ -2885,6 +3274,7 @@ ipcMain.handle("get-hardware-specs", async () => {
       // shell: false, // Default is false in helper
       // env merged in helper
     });
+    hardwareSpecsProcess = proc;
 
     let output = "";
     let errorOutput = "";
@@ -2895,7 +3285,10 @@ ipcMain.handle("get-hardware-specs", async () => {
       resolved = true;
       const errMsg = "Get specs timeout - killing process";
       console.error(errMsg);
-      proc.kill();
+      terminateChildProcessTree(proc, "[HardwareSpecs]");
+      if (hardwareSpecsProcess === proc) {
+        hardwareSpecsProcess = null;
+      }
       resolve({ error: errMsg });
     }, 30000);
 
@@ -2910,6 +3303,9 @@ ipcMain.handle("get-hardware-specs", async () => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timeout);
+      if (hardwareSpecsProcess === proc) {
+        hardwareSpecsProcess = null;
+      }
       const errMsg = `Failed to spawn specs process: ${err.message}`;
       console.error(errMsg);
       resolve({ error: errMsg });
@@ -2919,6 +3315,9 @@ ipcMain.handle("get-hardware-specs", async () => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timeout);
+      if (hardwareSpecsProcess === proc) {
+        hardwareSpecsProcess = null;
+      }
 
       if (code !== 0) {
         const err = `Get specs failed (code ${code}): ${errorOutput}`;
@@ -2962,93 +3361,6 @@ ipcMain.handle("get-hardware-specs", async () => {
   } finally {
     hardwareSpecsInFlight = null;
   }
-});
-
-ipcMain.handle("check-env-component", async (_event, component: string) => {
-  const middlewareDir = getMiddlewarePath();
-  const scriptPath = join(middlewareDir, "env_fixer.py");
-  const pythonCmd = getScriptPythonInfo();
-
-  console.log(`[EnvFixer] Checking component: ${component}`);
-
-  return new Promise((resolve) => {
-    if (!fs.existsSync(scriptPath)) {
-      resolve({ success: false, error: `Script not found: ${scriptPath}` });
-      return;
-    }
-
-    const proc = spawnPythonProcess(
-      pythonCmd,
-      ["env_fixer.py", "--check", "--json"],
-      {
-        cwd: middlewareDir,
-      },
-    );
-
-    let output = "";
-    let errorOutput = "";
-    let resolved = false;
-
-    const timeout = setTimeout(() => {
-      if (resolved) return;
-      resolved = true;
-      proc.kill();
-      resolve({ success: false, error: "Check timed out" });
-    }, 30000);
-
-    if (proc.stdout) {
-      proc.stdout.on("data", (d) => (output += d.toString()));
-    }
-    if (proc.stderr) {
-      proc.stderr.on("data", (d) => (errorOutput += d.toString()));
-    }
-
-    proc.on("error", (err) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timeout);
-      resolve({ success: false, error: err.message });
-    });
-
-    proc.on("close", (_code) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timeout);
-
-      try {
-        // 稳健提取：优先从进程输出解析 JSON，失败则回退读取报告文件
-        const mergedOutput = [output, errorOutput].filter(Boolean).join("\n");
-        const report =
-          extractLastJsonObject<any>(mergedOutput) ||
-          readEnvReportFromFile<any>(middlewareDir);
-        if (!report) {
-          resolve({
-            success: false,
-            error: "Failed to parse report: no JSON object found",
-            output,
-            errorOutput,
-          });
-          return;
-        }
-        // 找到指定组件的信息
-        const componentData = report.components?.find(
-          (c: any) => c.name.toLowerCase() === component.toLowerCase(),
-        );
-        resolve({
-          success: true,
-          report,
-          component: componentData || null,
-        });
-      } catch (e) {
-        resolve({
-          success: false,
-          error: `Failed to parse report: ${e}`,
-          output,
-          errorOutput,
-        });
-      }
-    });
-  });
 });
 
 const runEnvCheckReport = (
@@ -3122,7 +3434,6 @@ const runEnvCheckReport = (
     });
   });
 
-ipcMain.removeHandler("check-env-component");
 ipcMain.handle("check-env-component", async (_event, component: string) => {
   const middlewareDir = getMiddlewarePath();
   const scriptPath = join(middlewareDir, "env_fixer.py");
@@ -3211,11 +3522,11 @@ ipcMain.handle("fix-env-component", async (_event, component: string) => {
       resolved = true;
       proc.kill();
       resolve({ success: false, error: "Fix timed out (10 minutes)" });
-    }, 600000); // 10 分钟超时
+    }, 600000); // 10 鍒嗛挓瓒呮椂
     if (proc.stdout) {
       proc.stdout.on("data", (d) => {
         stdoutBuffer += d.toString();
-        // 解析进度并发送到前端（带分片拼接，避免跨 chunk JSON 断裂）
+        // 解析进度并发送到前端，避免跨 chunk 的 JSON 断裂。
         const lines = stdoutBuffer.split(/\r?\n/);
         stdoutBuffer = lines.pop() || "";
         for (const line of lines) {
@@ -3230,7 +3541,7 @@ ipcMain.handle("fix-env-component", async (_event, component: string) => {
               console.log(
                 `[EnvFixer] Progress: ${progressData.stage} ${progressData.progress}%`,
               );
-              // 将进度事件发送到前端
+              // 将进度事件发送到前端。
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send("env-fix-progress", {
                   component,
@@ -3241,7 +3552,7 @@ ipcMain.handle("fix-env-component", async (_event, component: string) => {
               console.error("[EnvFixer] Failed to parse progress:", e);
             }
           } else if (trimmedLine.startsWith("{") && trimmedLine.endsWith("}")) {
-            // 可能是结果 JSON 行，先收集后统一解析
+            // 可能是结果 JSON 行，先收集后统一解析。
             output += line + "\n";
           } else {
             output += line + "\n";
@@ -3269,7 +3580,7 @@ ipcMain.handle("fix-env-component", async (_event, component: string) => {
       }
 
       try {
-        // 清理 output 中可能夹杂的非 JSON 内容
+        // 清理 output 中可能夹杂的非 JSON 内容。
         const mergedOutput = [output, errorOutput].filter(Boolean).join("\n");
         const result = extractLastJsonObject<any>(mergedOutput);
         if (!result) {
@@ -3288,7 +3599,9 @@ ipcMain.handle("fix-env-component", async (_event, component: string) => {
             false,
           message:
             result.fixResult?.message ||
-            (result.summary?.overallStatus === "ok" ? "修复成功" : "未知结果"),
+            (result.summary?.overallStatus === "ok"
+              ? "Fix succeeded"
+              : "Unknown fix result"),
           exitCode: code,
           output,
           errorOutput,
@@ -3425,7 +3738,7 @@ ipcMain.handle("read-file", async (_event, path: string) => {
   return null;
 });
 
-// 写入文件（用于导出译文）
+// 写入文件（用于导出译文）。
 ipcMain.handle("write-file", async (_event, path: string, content: string) => {
   try {
     const safePath = ensureLocalFilePathForUserOperation(path);
@@ -3454,7 +3767,7 @@ ipcMain.handle(
   },
 );
 
-// 加载翻译缓存（用于校对界面）
+// 加载翻译缓存（用于校对界面）。
 ipcMain.handle("load-cache", async (_event, cachePath: string) => {
   try {
     const safePath = ensureLocalFilePathForUserOperation(cachePath);
@@ -3468,33 +3781,263 @@ ipcMain.handle("load-cache", async (_event, cachePath: string) => {
   return null;
 });
 
-// 保存翻译缓存（用于校对界面）
+// 保存翻译缓存（用于校对界面）。
 ipcMain.handle(
   "save-cache",
   async (_event, cachePath: string, data: Record<string, unknown>) => {
-    try {
-      const safePath = ensureLocalFilePathForUserOperation(cachePath);
-      await fs.promises.mkdir(dirname(safePath), { recursive: true });
+    const tryWriteCacheJson = async (targetPath: string): Promise<string> => {
+      const safePath = ensureLocalFilePathForUserOperation(targetPath);
+      await ensureDirExists(safePath);
       await fs.promises.writeFile(
         safePath,
         JSON.stringify(data, null, 2),
         "utf-8",
       );
+      return safePath;
+    };
+    try {
+      await tryWriteCacheJson(cachePath);
       return true;
     } catch (e) {
+      const primaryError = e instanceof Error ? e.message : String(e);
+      const fallbackCandidates: string[] = [];
+      const outputPathRaw = String((data as Record<string, unknown>)?.outputPath || "").trim();
+      if (outputPathRaw) {
+        fallbackCandidates.push(`${outputPathRaw}.cache.json`);
+      }
+      const dedupedFallbackCandidates = Array.from(new Set(fallbackCandidates));
+      for (const candidatePath of dedupedFallbackCandidates) {
+        if (!candidatePath || candidatePath === cachePath) continue;
+        try {
+          const savedPath = await tryWriteCacheJson(candidatePath);
+          console.warn(
+            "[save-cache] Primary path failed, fallback succeeded:",
+            {
+              requestedPath: cachePath,
+              fallbackPath: savedPath,
+              primaryError,
+            },
+          );
+          return {
+            ok: true,
+            path: savedPath,
+            warning: "save_cache_fallback_path_used",
+          };
+        } catch {
+          // continue to next fallback candidate
+        }
+      }
       console.error("save-cache error:", e);
+      return {
+        ok: false,
+        error: primaryError || "save_cache_failed",
+      };
+    }
+  },
+);
+
+ipcMain.handle("history-detail-load", async (_event, id: string) => {
+  try {
+    const safePath = getHistoryDetailCacheFilePath(id);
+    if (!fs.existsSync(safePath)) return null;
+    const content = await fs.promises.readFile(safePath, "utf-8");
+    return normalizeHistoryDetailPayload(JSON.parse(content));
+  } catch (e) {
+    console.error("history-detail-load error:", e);
+    return null;
+  }
+});
+
+ipcMain.handle(
+  "history-detail-save",
+  async (_event, id: string, detail: unknown) => {
+    try {
+      const safePath = getHistoryDetailCacheFilePath(id);
+      await ensureDirExists(safePath);
+      const normalized = normalizeHistoryDetailPayload(detail);
+      await fs.promises.writeFile(safePath, JSON.stringify(normalized), "utf-8");
+      return true;
+    } catch (e) {
+      console.error("history-detail-save error:", e);
       return false;
     }
   },
 );
 
-// 重建文档（从缓存）
+ipcMain.handle("history-detail-delete", async (_event, id: string) => {
+  try {
+    const safePath = getHistoryDetailCacheFilePath(id);
+    if (fs.existsSync(safePath)) {
+      await fs.promises.unlink(safePath);
+    }
+    return true;
+  } catch (e) {
+    console.error("history-detail-delete error:", e);
+    return false;
+  }
+});
+
+ipcMain.handle(
+  "history-detail-prune",
+  async (_event, allowedIds: string[]) => {
+    try {
+      const cacheDir = getHistoryDetailCacheDir();
+      if (!fs.existsSync(cacheDir)) return true;
+      const allowedFiles = new Set<string>();
+      for (const id of Array.isArray(allowedIds) ? allowedIds : []) {
+        try {
+          allowedFiles.add(`${sanitizeHistoryDetailId(id)}.json`);
+        } catch {
+          // Ignore invalid IDs in prune list.
+        }
+      }
+      const entries = await fs.promises.readdir(cacheDir, {
+        withFileTypes: true,
+      });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        if (!entry.name.toLowerCase().endsWith(".json")) continue;
+        if (allowedFiles.has(entry.name)) continue;
+        try {
+          await fs.promises.unlink(join(cacheDir, entry.name));
+        } catch {
+          // Best-effort cleanup.
+        }
+      }
+      return true;
+    } catch (e) {
+      console.error("history-detail-prune error:", e);
+      return false;
+    }
+  },
+);
+
+ipcMain.handle("history-detail-clear-all", async () => {
+  try {
+    const cacheDir = getHistoryDetailCacheDir();
+    if (!fs.existsSync(cacheDir)) return true;
+    const entries = await fs.promises.readdir(cacheDir, {
+      withFileTypes: true,
+    });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.toLowerCase().endsWith(".json")) continue;
+      try {
+        await fs.promises.unlink(join(cacheDir, entry.name));
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
+    return true;
+  } catch (e) {
+    console.error("history-detail-clear-all error:", e);
+    return false;
+  }
+});
+
+// 重建文档（基于缓存）。
 ipcMain.handle("rebuild-doc", async (_event, { cachePath, outputPath }) => {
+  let tempPatchedCachePath = "";
   try {
     const safeCachePath = ensureLocalFilePathForUserOperation(cachePath);
-    const safeOutputPath = outputPath
-      ? ensureLocalFilePathForUserOperation(outputPath)
-      : undefined;
+    const cacheRaw = await fs.promises.readFile(safeCachePath, "utf-8");
+    const cacheData =
+      (JSON.parse(cacheRaw) as Record<string, unknown>) || ({} as Record<string, unknown>);
+    const normalizeSafePath = (value: unknown): string => {
+      const raw = String(value || "").trim();
+      if (!raw) return "";
+      try {
+        return ensureLocalFilePathForUserOperation(raw);
+      } catch {
+        return "";
+      }
+    };
+    const dedupe = (values: string[]): string[] => {
+      const result: string[] = [];
+      for (const value of values) {
+        const normalized = String(value || "").trim();
+        if (!normalized || result.includes(normalized)) continue;
+        result.push(normalized);
+      }
+      return result;
+    };
+    const resolveExistingFile = (values: string[]): string =>
+      dedupe(values).find((value) => {
+        if (!value || !fs.existsSync(value)) return false;
+        try {
+          return fs.statSync(value).isFile();
+        } catch {
+          return false;
+        }
+      }) || "";
+    const deriveSourceCandidatesFromOutput = (value: string): string[] => {
+      if (!value) return [];
+      const parsed = parse(value);
+      const ext = parsed.ext;
+      const stem = parsed.name;
+      const candidates: string[] = [];
+      if (/_translated$/i.test(stem)) {
+        candidates.push(join(parsed.dir, `${stem.replace(/_translated$/i, "")}${ext}`));
+      }
+      if (stem.includes("_")) {
+        const withoutLastSuffix = stem.replace(/_[^_]+$/, "");
+        if (withoutLastSuffix && withoutLastSuffix !== stem) {
+          candidates.push(join(parsed.dir, `${withoutLastSuffix}${ext}`));
+        }
+      }
+      return candidates;
+    };
+
+    const safeExplicitOutput = normalizeSafePath(outputPath);
+    const cacheOutputPath = normalizeSafePath(cacheData.outputPath);
+    const cacheDerivedOutputPath = safeCachePath.match(/\.cache\.json$/i)
+      ? safeCachePath.replace(/\.cache\.json$/i, "")
+      : "";
+    const outputCandidates = dedupe([
+      safeExplicitOutput,
+      cacheOutputPath,
+      cacheDerivedOutputPath,
+    ]);
+    const resolvedOutputPath = outputCandidates[0] || "";
+
+    const cacheSourcePath = normalizeSafePath(cacheData.sourcePath);
+    const sourceCandidates = dedupe([
+      cacheSourcePath,
+      ...outputCandidates.flatMap(deriveSourceCandidatesFromOutput),
+      safeExplicitOutput,
+      cacheOutputPath,
+      cacheDerivedOutputPath,
+    ]);
+    const resolvedSourcePath = resolveExistingFile(sourceCandidates);
+
+    let effectiveCachePath = safeCachePath;
+    const needsOutputPatch =
+      !!resolvedOutputPath && resolvedOutputPath !== cacheOutputPath;
+    const needsSourcePatch =
+      !!resolvedSourcePath && resolvedSourcePath !== cacheSourcePath;
+    if (needsOutputPatch || needsSourcePatch) {
+      const patchedCacheData: Record<string, unknown> = { ...cacheData };
+      if (needsOutputPatch) patchedCacheData.outputPath = resolvedOutputPath;
+      if (needsSourcePatch) patchedCacheData.sourcePath = resolvedSourcePath;
+      tempPatchedCachePath = join(
+        dirname(safeCachePath),
+        `temp_rebuild_cache_${randomUUID().slice(0, 8)}.json`,
+      );
+      await fs.promises.writeFile(
+        tempPatchedCachePath,
+        JSON.stringify(patchedCacheData, null, 2),
+        "utf-8",
+      );
+      effectiveCachePath = tempPatchedCachePath;
+    }
+
+    if (!resolvedSourcePath) {
+      console.warn(
+        "[Rebuild] No valid source path found in cache candidates:",
+        sourceCandidates,
+      );
+    }
+
     const middlewareDir = getMiddlewarePath();
     const scriptPath = join(middlewareDir, "murasaki_translator", "main.py");
     const pythonCmd = getPythonPath();
@@ -3504,11 +4047,11 @@ ipcMain.handle("rebuild-doc", async (_event, { cachePath, outputPath }) => {
       "--file",
       "REBUILD_STUB", // Parser requires --file
       "--rebuild-from-cache",
-      safeCachePath,
+      effectiveCachePath,
     ];
 
-    if (safeOutputPath) {
-      args.push("--output", safeOutputPath);
+    if (resolvedOutputPath) {
+      args.push("--output", resolvedOutputPath);
     }
 
     console.log("[Rebuild] Executing:", pythonCmd, args.join(" "));
@@ -3525,6 +4068,13 @@ ipcMain.handle("rebuild-doc", async (_event, { cachePath, outputPath }) => {
       }
 
       proc.on("close", (code: number) => {
+        if (tempPatchedCachePath) {
+          try {
+            fs.unlinkSync(tempPatchedCachePath);
+          } catch {
+            // ignore temp cache cleanup failure
+          }
+        }
         if (code === 0) {
           resolve({ success: true });
         } else {
@@ -3536,12 +4086,19 @@ ipcMain.handle("rebuild-doc", async (_event, { cachePath, outputPath }) => {
       });
     });
   } catch (e: unknown) {
+    if (tempPatchedCachePath) {
+      try {
+        fs.unlinkSync(tempPatchedCachePath);
+      } catch {
+        // ignore temp cache cleanup failure
+      }
+    }
     const errorMsg = e instanceof Error ? e.message : String(e);
     return { success: false, error: errorMsg };
   }
 });
 
-// 单块重翻（用于校对界面）
+// 单块重翻（用于校对界面）。
 ipcMain.handle(
   "retranslate-block",
   async (
@@ -3570,7 +4127,9 @@ ipcMain.handle(
       for (const artifactPath of tempArtifacts) {
         try {
           fs.unlinkSync(artifactPath);
-        } catch (_) {}
+        } catch {
+          // ignore temporary artifact cleanup failure
+        }
       }
     };
 
@@ -3589,17 +4148,20 @@ ipcMain.handle(
         process.env.MURASAKI_PROFILES_DIR ||
         process.env.PIPELINE_V2_PROFILES_DIR ||
         "";
-      const profilesDir = envProfilesDir.trim()
-        ? resolve(envProfilesDir.trim())
-        : getPipelineV2ProfilesDir();
-      try {
-        fs.mkdirSync(profilesDir, { recursive: true });
-      } catch (_) {}
+      const profilesDir = resolveProfilesDirWithLegacyFallback({
+        profilesDir: envProfilesDir.trim()
+          ? resolve(envProfilesDir.trim())
+          : getPipelineV2ProfilesDir(getMiddlewarePath()),
+        legacyDir: getPipelineV2ProfilesDir(app.getPath("userData")),
+        fsLike: fs,
+      }).activeDir;
 
       const tempDir = join(getUserDataPath(), "temp");
       try {
         fs.mkdirSync(tempDir, { recursive: true });
-      } catch (_) {}
+      } catch {
+        // ignore temp dir mkdir failure
+      }
       const uid = randomUUID().slice(0, 8);
       const inputPath = join(tempDir, `proofread_v2_${uid}.txt`);
       const outputPath = join(tempDir, `proofread_v2_${uid}_out.txt`);
@@ -3770,14 +4332,14 @@ ipcMain.handle(
       if (config.deviceMode === "cpu") {
         args.push("--gpu-layers", "0");
       } else {
-        // 默认使用 -1（尽可能加载到 GPU），若用户指定则使用用户值
+        // 默认使用 -1（尽可能加载到 GPU），用户指定时使用用户值。
         const gpuLayers =
           config.gpuLayers !== undefined ? config.gpuLayers : -1;
         args.push("--gpu-layers", gpuLayers.toString());
       }
 
       if (config.ctxSize) args.push("--ctx", config.ctxSize);
-      if (config.temperature)
+      if (config.temperature !== undefined)
         args.push("--temperature", config.temperature.toString());
       if (config.repPenaltyBase)
         args.push("--rep-penalty-base", config.repPenaltyBase.toString());
@@ -3807,7 +4369,7 @@ ipcMain.handle(
         );
         args.push(
           "--line-tolerance-pct",
-          ((config.lineTolerancePct ?? 20) / 100).toString(),
+          normalizeLineTolerancePct(config.lineTolerancePct, 0.2).toString(),
         );
       }
       if (config.anchorCheck) {
@@ -3875,10 +4437,7 @@ ipcMain.handle(
     // Let's check if ServerManager has a running instance.
     const sm = ServerManager.getInstance();
     const status = sm.getStatus();
-    if (status.running && status.mode !== "api_v1") {
-      args.push("--server", `http://127.0.0.1:${status.port}`);
-      args.push("--no-server-spawn");
-    } else if (status.running && status.mode === "api_v1") {
+    if (status.running) {
       console.warn(
         "[Retranslate] Local daemon is api_v1 mode, fallback to direct llama-server path for compatibility.",
       );
@@ -3887,9 +4446,16 @@ ipcMain.handle(
     console.log("[Retranslate] Spawning:", pythonCmd, args.join(" "));
 
     return new Promise((resolve) => {
+      const normalizedGpuDeviceId = normalizeCudaVisibleDevices(
+        config?.gpuDeviceId,
+      );
+      const retranslateEnv: NodeJS.ProcessEnv = {};
+      if (normalizedGpuDeviceId) {
+        retranslateEnv.CUDA_VISIBLE_DEVICES = normalizedGpuDeviceId;
+      }
       const proc = spawnPythonProcess(pythonCmd, args, {
         cwd: middlewareDir,
-        env: { CUDA_VISIBLE_DEVICES: config?.gpuDeviceId }, // Only pass custom vars, helper merges process.env and sanitizes
+        env: retranslateEnv, // Helper merges process.env and sanitizes
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -3992,7 +4558,7 @@ ipcMain.handle(
   },
 );
 
-// 保存文件对话框
+// 保存文件对话框。
 ipcMain.handle(
   "save-file",
   async (
@@ -4012,7 +4578,7 @@ ipcMain.handle(
   },
 );
 
-// 打开文件（使用系统默认程序）
+// 打开文件（使用系统默认程序）。
 ipcMain.handle("open-path", async (_event, filePath: string) => {
   if (fs.existsSync(filePath)) {
     return await shell.openPath(filePath);
@@ -4020,7 +4586,20 @@ ipcMain.handle("open-path", async (_event, filePath: string) => {
   return "File not found";
 });
 
-// 在文件管理器中显示文件/文件夹
+ipcMain.handle("clipboard-write", async (_event, text: string) => {
+  try {
+    const normalized = typeof text === "string" ? text : String(text ?? "");
+    clipboard.writeText(normalized);
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+// 在文件管理器中显示文件或文件夹。
 ipcMain.handle("open-folder", async (_event, filePath: string) => {
   if (!filePath || typeof filePath !== "string") return false;
 
@@ -4070,86 +4649,324 @@ ipcMain.handle(
   "check-output-file-exists",
   async (_event, { inputFile, config }) => {
     try {
-      const { basename, extname, join } = await import("path");
-      const fs = await import("fs");
+      const normalizedInput = String(inputFile || "").trim();
+      if (!normalizedInput) return { exists: false };
+      const safeInput = ensureLocalFilePathForUserOperation(normalizedInput);
+      const safeConfig = config || {};
 
       const remoteUrl = String(
-        config?.remoteUrl || config?.serverUrl || "",
+        safeConfig?.remoteUrl || safeConfig?.serverUrl || "",
       ).trim();
-      if (config?.executionMode === "remote" && remoteUrl) {
-        try {
-          const parsed = new URL(remoteUrl);
-          const host = parsed.hostname.toLowerCase();
-          const isLocalHost = host === "127.0.0.1" || host === "localhost";
-          if (!isLocalHost) {
-            return { exists: false };
-          }
-        } catch {
-          // ignore malformed URL
-        }
+      const remotePrecheckScope = resolveRemoteOutputPrecheck({
+        executionMode: safeConfig?.executionMode,
+        remoteUrl: remoteUrl || undefined,
+      });
+      if (remotePrecheckScope.skipLocalProbe) {
+        return {
+          exists: false,
+          remoteCheckSkipped: true,
+          remoteHost: remotePrecheckScope.remoteHost,
+        };
       }
 
-      let outPath = "";
-      const engineMode = String(config?.engineMode || "").trim();
-      if (config?.outputPath && typeof config.outputPath === "string") {
-        outPath = config.outputPath;
-      } else if (engineMode === "v2") {
-        if (config.outputDir && fs.existsSync(config.outputDir)) {
-          const ext = extname(inputFile);
-          const baseName = basename(inputFile, ext);
-          const outFilename = ext
-            ? `${baseName}_translated${ext}`
-            : `${baseName}_translated`;
-          outPath = join(config.outputDir, outFilename);
+      const candidateOutPaths: string[] = [];
+      const pushCandidate = (candidate: unknown) => {
+        const normalized = String(candidate || "").trim();
+        if (!normalized) return;
+        try {
+          const safeCandidate = ensureLocalFilePathForUserOperation(normalized);
+          if (!candidateOutPaths.includes(safeCandidate)) {
+            candidateOutPaths.push(safeCandidate);
+          }
+        } catch {
+          // ignore invalid path candidate
+        }
+      };
+
+      const engineMode = String(safeConfig?.engineMode || "")
+        .trim()
+        .toLowerCase();
+      const explicitOutputPath = String(safeConfig?.outputPath || "").trim();
+      const outputDirRaw = String(safeConfig?.outputDir || "").trim();
+      let safeOutputDir = "";
+      if (outputDirRaw) {
+        try {
+          safeOutputDir = ensureLocalFilePathForUserOperation(outputDirRaw);
+        } catch {
+          safeOutputDir = "";
+        }
+      }
+      const hasOutputDir = (() => {
+        if (!safeOutputDir || !fs.existsSync(safeOutputDir)) return false;
+        try {
+          return fs.statSync(safeOutputDir).isDirectory();
+        } catch {
+          return false;
+        }
+      })();
+
+      pushCandidate(explicitOutputPath);
+      if (engineMode === "v2") {
+        const ext = parse(safeInput).ext;
+        const baseName = ext ? basename(safeInput, ext) : basename(safeInput);
+        if (hasOutputDir) {
+          pushCandidate(
+            join(
+              safeOutputDir,
+              ext ? `${baseName}_translated${ext}` : `${baseName}_translated`,
+            ),
+          );
         } else {
-          const ext = extname(inputFile);
-          const base = inputFile.substring(0, inputFile.length - ext.length);
-          outPath = `${base}_translated${ext}`;
+          const base = ext ? safeInput.slice(0, -ext.length) : safeInput;
+          pushCandidate(`${base}_translated${ext}`);
+        }
+
+        if (!explicitOutputPath) {
+          const ext = parse(safeInput).ext;
+          const inputDir = dirname(safeInput);
+          const inputBaseName = ext
+            ? basename(safeInput, ext)
+            : basename(safeInput);
+          try {
+            const discovered = fs
+              .readdirSync(inputDir)
+              .filter((entry) => {
+                if (!entry.startsWith(`${inputBaseName}_`)) return false;
+                if (ext && !entry.endsWith(ext)) return false;
+                return true;
+              })
+              .map((entry) => join(inputDir, entry))
+              .filter((entryPath) => {
+                try {
+                  return fs.statSync(entryPath).isFile();
+                } catch {
+                  return false;
+                }
+              })
+              .sort((a, b) => {
+                try {
+                  return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+                } catch {
+                  return 0;
+                }
+              });
+            discovered.forEach(pushCandidate);
+          } catch {
+            // ignore discovery errors
+          }
         }
       } else {
-        // Logic must match main.py and start-translation handler
-        if (config.outputDir && fs.existsSync(config.outputDir)) {
-          const ext = inputFile.split(".").pop();
-          const baseName = basename(inputFile, `.${ext}`);
-          const outFilename = `${baseName}_translated.${ext}`;
-          outPath = join(config.outputDir, outFilename);
+        if (hasOutputDir) {
+          const ext = parse(safeInput).ext;
+          const extName = ext.startsWith(".") ? ext.slice(1) : ext;
+          const baseName = ext ? basename(safeInput, ext) : basename(safeInput);
+          const outFilename = extName
+            ? `${baseName}_translated.${extName}`
+            : `${baseName}_translated`;
+          pushCandidate(join(safeOutputDir, outFilename));
         } else {
-          const ext = extname(inputFile);
-          const base = inputFile.substring(0, inputFile.length - ext.length);
+          const ext = parse(safeInput).ext;
+          const base = ext ? safeInput.slice(0, -ext.length) : safeInput;
           let modelName = "unknown";
           if (
-            config.modelPath &&
-            typeof config.modelPath === "string" &&
-            config.modelPath.trim()
+            safeConfig.modelPath &&
+            typeof safeConfig.modelPath === "string" &&
+            safeConfig.modelPath.trim()
           ) {
-            const normalizedPath = config.modelPath.replace(/\\/g, "/");
+            const normalizedPath = safeConfig.modelPath.replace(/\\/g, "/");
             const fileName = normalizedPath.split("/").pop() || "";
             modelName = fileName.replace(/\.gguf$/i, "") || "unknown";
           }
-          const suffix = `_${modelName}`;
-          outPath = `${base}${suffix}${ext}`;
+          pushCandidate(`${base}_${modelName}${ext}`);
         }
       }
-      console.log("[check-output-file-exists] inputFile:", inputFile);
-      console.log("[check-output-file-exists] outPath:", outPath);
 
-      if (fs.existsSync(outPath)) {
-        console.log("Detected existing output:", outPath);
-        return { exists: true, path: outPath };
+      const cacheDirRaw = String(safeConfig?.cacheDir || "").trim();
+      let safeCacheDir = "";
+      if (cacheDirRaw) {
+        try {
+          safeCacheDir = ensureLocalFilePathForUserOperation(cacheDirRaw);
+        } catch {
+          safeCacheDir = "";
+        }
+      }
+      const hasCacheDir = (() => {
+        if (!safeCacheDir || !fs.existsSync(safeCacheDir)) return false;
+        try {
+          return fs.statSync(safeCacheDir).isDirectory();
+        } catch {
+          return false;
+        }
+      })();
+
+      const resolveResumeOutputPath = (
+        artifactPath: string,
+        fallbackOutputPath?: string,
+      ): string => {
+        if (fallbackOutputPath) return fallbackOutputPath;
+        if (artifactPath.endsWith(".temp.jsonl")) {
+          return artifactPath.slice(0, -".temp.jsonl".length);
+        }
+        if (artifactPath.endsWith(".cache.json")) {
+          return artifactPath.slice(0, -".cache.json".length);
+        }
+        return artifactPath;
+      };
+
+      console.log("[check-output-file-exists] inputFile:", safeInput);
+      console.log(
+        "[check-output-file-exists] candidateOutPaths:",
+        candidateOutPaths,
+      );
+      for (const candidatePath of candidateOutPaths) {
+        if (fs.existsSync(candidatePath)) {
+          console.log("Detected existing output:", candidatePath);
+          return {
+            exists: true,
+            path: candidatePath,
+            resumeOutputPath: candidatePath,
+          };
+        }
+
+        const tempPath = `${candidatePath}.temp.jsonl`;
+        if (fs.existsSync(tempPath)) {
+          console.log("Detected existing temp progress:", tempPath);
+          return {
+            exists: true,
+            path: tempPath,
+            isCache: true,
+            resumeOutputPath: candidatePath,
+          };
+        }
+
+        const defaultCachePath = `${candidatePath}.cache.json`;
+        if (fs.existsSync(defaultCachePath)) {
+          console.log("Detected existing cache:", defaultCachePath);
+          return {
+            exists: true,
+            path: defaultCachePath,
+            isCache: true,
+            resumeOutputPath: candidatePath,
+          };
+        }
+
+        if (hasCacheDir) {
+          const customCachePath = join(
+            safeCacheDir,
+            `${basename(candidatePath)}.cache.json`,
+          );
+          if (fs.existsSync(customCachePath)) {
+            console.log("Detected existing custom cache:", customCachePath);
+            return {
+              exists: true,
+              path: customCachePath,
+              isCache: true,
+              resumeOutputPath: candidatePath,
+            };
+          }
+        }
       }
 
-      // 检测临时进度文件（翻译中断后的主要缓存）
-      const tempPath = outPath + ".temp.jsonl";
-      if (fs.existsSync(tempPath)) {
-        console.log("Detected existing temp progress:", tempPath);
-        return { exists: true, path: tempPath, isCache: true };
-      }
+      if (engineMode === "v2") {
+        type ArtifactMatch = {
+          path: string;
+          isCache?: boolean;
+          resumeOutputPath?: string;
+        };
+        const parsedInput = parse(safeInput);
+        const inputBaseName = parsedInput.name;
+        const inputExt = parsedInput.ext;
+        const defaultResumeDir = hasOutputDir
+          ? safeOutputDir
+          : dirname(safeInput);
+        const scanDirs = Array.from(
+          new Set(
+            [
+              dirname(safeInput),
+              hasOutputDir ? safeOutputDir : "",
+              hasCacheDir ? safeCacheDir : "",
+            ]
+              .map((value) => String(value || "").trim())
+              .filter(Boolean),
+          ),
+        );
+        const discovered: ArtifactMatch[] = [];
+        const pushDiscovered = (
+          artifactPath: string,
+          isCache = false,
+          resumeOutputPath?: string,
+        ) => {
+          if (!artifactPath) return;
+          if (discovered.some((item) => item.path === artifactPath)) return;
+          discovered.push({
+            path: artifactPath,
+            isCache,
+            resumeOutputPath: resolveResumeOutputPath(
+              artifactPath,
+              resumeOutputPath,
+            ),
+          });
+        };
+        const getMtime = (artifactPath: string): number => {
+          try {
+            return fs.statSync(artifactPath).mtimeMs;
+          } catch {
+            return 0;
+          }
+        };
 
-      // 兼容旧版缓存文件
-      const cachePath = outPath + ".cache.json";
-      if (fs.existsSync(cachePath)) {
-        console.log("Detected existing cache:", cachePath);
-        return { exists: true, path: cachePath, isCache: true };
+        for (const dirPath of scanDirs) {
+          let entries: string[] = [];
+          try {
+            entries = fs.readdirSync(dirPath);
+          } catch {
+            continue;
+          }
+
+          for (const entry of entries) {
+            if (!entry.startsWith(`${inputBaseName}_`)) continue;
+            const fullPath = join(dirPath, entry);
+            let isFile = false;
+            try {
+              isFile = fs.statSync(fullPath).isFile();
+            } catch {
+              isFile = false;
+            }
+            if (!isFile) continue;
+
+            if (entry.endsWith(".temp.jsonl")) {
+              if (!inputExt || entry.includes(`${inputExt}.temp.jsonl`)) {
+                const outputName = entry.replace(/\.temp\.jsonl$/i, "");
+                const fallbackOutput = join(defaultResumeDir, outputName);
+                pushDiscovered(fullPath, true, fallbackOutput);
+              }
+              continue;
+            }
+            if (entry.endsWith(".cache.json")) {
+              if (!inputExt || entry.includes(`${inputExt}.cache.json`)) {
+                const outputName = entry.replace(/\.cache\.json$/i, "");
+                const fallbackOutput = join(defaultResumeDir, outputName);
+                pushDiscovered(fullPath, true, fallbackOutput);
+              }
+              continue;
+            }
+            if (!inputExt || entry.endsWith(inputExt)) {
+              pushDiscovered(fullPath, false, fullPath);
+            }
+          }
+        }
+
+        if (discovered.length > 0) {
+          discovered.sort((a, b) => getMtime(b.path) - getMtime(a.path));
+          const latest = discovered[0];
+          console.log("[check-output-file-exists] v2 wildcard detected:", latest);
+          return {
+            exists: true,
+            path: latest.path,
+            isCache: latest.isCache,
+            resumeOutputPath: latest.resumeOutputPath,
+          };
+        }
       }
 
       return { exists: false };
@@ -4336,13 +5153,13 @@ const buildRemoteTranslateOptionsFromConfig = (
     chunkSize: toInt(config?.chunkSize, 1000),
     ctx: toInt(config?.ctxSize, 8192),
     gpuLayers: config?.deviceMode === "cpu" ? 0 : parsedGpuLayers,
-    temperature: toFloat(config?.temperature, 0.7),
+    temperature: toFloat(config?.temperature, 0.3),
     lineFormat: config?.lineFormat || "single",
     strictMode: config?.strictMode || "off",
     lineCheck: config?.lineCheck !== false,
     lineToleranceAbs: toInt(config?.lineToleranceAbs, 10),
     lineTolerancePct: normalizeLineTolerancePct(config?.lineTolerancePct, 0.2),
-    anchorCheck: config?.anchorCheck !== false,
+    anchorCheck: config?.anchorCheck === true,
     anchorCheckRetries: toInt(config?.anchorCheckRetries, 1),
     traditional: config?.traditional === true,
     saveCot: config?.saveCot === true,
@@ -4392,7 +5209,7 @@ const buildRemoteTranslateOptionsFromConfig = (
     fixRuby: config?.fixRuby === true,
     fixKana: config?.fixKana === true,
     fixPunctuation: config?.fixPunctuation === true,
-    gpuDeviceId: String(config?.gpuDeviceId || "").trim() || undefined,
+    gpuDeviceId: normalizeCudaVisibleDevices(config?.gpuDeviceId),
   };
 };
 
@@ -4450,6 +5267,22 @@ const runTranslationViaRemoteApi = async (
   let wsClient: WebSocket | null = null;
   let lastProgressSeenAt = 0;
   let lastWsLogAt = 0;
+  let consecutiveStatusFailures = 0;
+  let completionPhase = false;
+
+  const isRecoverableRemoteTransportError = (error: unknown) => {
+    const message =
+      error instanceof Error
+        ? error.message.toLowerCase()
+        : String(error).toLowerCase();
+    return (
+      message.includes("timeout") ||
+      message.includes("network") ||
+      message.includes("fetch failed") ||
+      message.includes("econnreset") ||
+      message.includes("etimedout")
+    );
+  };
 
   const emitRemoteLog = (message: string, level: LogLevel = "info") => {
     replyLogUpdate(event, message, {
@@ -4496,7 +5329,7 @@ const runTranslationViaRemoteApi = async (
   };
   const emitRemoteTroubleshootingHint = () => {
     const hint =
-      "System: 远程排查：服务管理 → 远程运行详情 可打开网络日志/任务镜像日志（可按任务ID过滤）";
+      "System: Remote troubleshooting: open Service Manager > Remote Run Details to inspect network and task mirror logs.";
     emitRemoteLog(hint, "info");
     appendRemoteMirrorMessage({
       taskId,
@@ -4514,7 +5347,7 @@ const runTranslationViaRemoteApi = async (
       // ignore health fetch failure
     }
     emitRemoteLog(`System: Execution mode remote-api (${sourceLabel})`, "info");
-    // [Feature] 发送远程执行信息供 Dashboard 记录到翻译历史
+    // [Feature] 发送远程执行信息，供 Dashboard 写入翻译历史。
     const remoteInfoPayload = {
       executionMode: "remote-api",
       source: sourceLabel,
@@ -4583,7 +5416,11 @@ const runTranslationViaRemoteApi = async (
       client,
       taskId,
       cancelRequested: false,
+      runId,
     };
+    if (translationStopRequested) {
+      requestRemoteTaskCancel();
+    }
     emitRemoteLog(`System: Remote task created (${taskId})`, "info");
     appendRemoteMirrorMessage({
       taskId,
@@ -4611,19 +5448,74 @@ const runTranslationViaRemoteApi = async (
         onError: () => {
           wsActive = false;
         },
+        onProgress: (progress, currentBlock, totalBlocks) => {
+          wsActive = true;
+          const percentRaw =
+            typeof progress === "number" && Number.isFinite(progress)
+              ? progress <= 1
+                ? progress * 100
+                : progress
+              : totalBlocks > 0
+                ? (currentBlock / totalBlocks) * 100
+                : 0;
+          const progressPayload = {
+            current: Number.isFinite(currentBlock) ? currentBlock : 0,
+            total: Number.isFinite(totalBlocks) ? totalBlocks : 0,
+            percent: Math.max(0, Math.min(100, Number(percentRaw.toFixed(2)))),
+          };
+          const progressSig = `${progressPayload.current}/${progressPayload.total}/${progressPayload.percent}`;
+          if (progressSig !== lastProgressSig) {
+            emitRemoteJson("JSON_PROGRESS:", progressPayload);
+            lastProgressSig = progressSig;
+          }
+          lastProgressSeenAt = Date.now();
+        },
+        onComplete: () => {
+          wsActive = false;
+        },
       });
     } catch {
       wsClient = null;
       wsActive = false;
     }
 
-    while (true) {
+    for (;;) {
       if (!remoteTranslationBridge || remoteTranslationBridge.taskId !== taskId)
         return;
-      const status = await client.getTaskStatus(taskId, {
-        logFrom: nextLogIndex,
-        logLimit: wsActive ? 80 : 200,
-      });
+      let status;
+      try {
+        status = await client.getTaskStatus(
+          taskId,
+          {
+            logFrom: nextLogIndex,
+            logLimit: wsActive ? 80 : 200,
+          },
+          {
+            maxAttempts: 1,
+            timeoutMs: 30000,
+          },
+        );
+        consecutiveStatusFailures = 0;
+      } catch (statusError) {
+        if (
+          !completionPhase &&
+          !translationStopRequested &&
+          isRecoverableRemoteTransportError(statusError)
+        ) {
+          consecutiveStatusFailures += 1;
+          emitRemoteLog(
+            `System: Remote status check failed (${consecutiveStatusFailures}). Retrying...`,
+            "warn",
+          );
+          if (consecutiveStatusFailures <= 20) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, Math.min(5000, 1000 * consecutiveStatusFailures)),
+            );
+            continue;
+          }
+        }
+        throw statusError;
+      }
       if (!remoteTranslationBridge || remoteTranslationBridge.taskId !== taskId)
         return;
 
@@ -4631,7 +5523,7 @@ const runTranslationViaRemoteApi = async (
       if (wsActive && lastWsLogAt > 0 && Date.now() - lastWsLogAt > 2000) {
         wsActive = false;
       }
-      // 检查日志中是否已含 main.py 输出的 JSON_PROGRESS（含真实速度/token 数据）
+      // 检查日志中是否包含 main.py 输出的 JSON_PROGRESS（真实速度/token 数据）。
       const logsContainProgress = taskLogs.some(
         (log) => typeof log === "string" && log.includes("JSON_PROGRESS:"),
       );
@@ -4650,8 +5542,8 @@ const runTranslationViaRemoteApi = async (
         nextLogIndex = Math.max(nextLogIndex, nextLogIndex + taskLogs.length);
       }
 
-      // 仅当日志中无 JSON_PROGRESS 时才发送补充性 block 进度
-      // 避免用硬编码零值覆盖 main.py 的真实速度/token 数据
+      // 仅在无 JSON_PROGRESS 时发送补充的 block 进度。
+      // 閬垮厤鐢ㄧ‖缂栫爜闆跺€艰鐩?main.py 鐨勭湡瀹為€熷害/token 鏁版嵁
       const recentlySawProgress = Date.now() - lastProgressSeenAt < 1500;
       if (!logsContainProgress && !recentlySawProgress) {
         const percentRaw =
@@ -4676,32 +5568,47 @@ const runTranslationViaRemoteApi = async (
       }
 
       if (status.status === "completed") {
-        // [Fix Bug 6/7] 追加获取所有剩余日志，确保 JSON_FINAL/PREVIEW_BLOCK 不被 200 行分页截断
+        completionPhase = true;
+        // [Fix Bug 6/7] 获取剩余日志，确保 JSON_FINAL/PREVIEW_BLOCK 不被 200 行分页截断。
         if (
           typeof status.logTotal === "number" &&
           nextLogIndex < status.logTotal
         ) {
-          const finalStatus = await client.getTaskStatus(taskId, {
-            logFrom: nextLogIndex,
-            logLimit: 1000,
-          });
-          const finalLogs = Array.isArray(finalStatus.logs)
-            ? finalStatus.logs
-            : [];
-          if (finalLogs.length > 0) {
-            finalLogs.forEach((logLine) => {
-              if (!logLine) return;
-              handleRemoteLogLine(logLine, "poll");
-            });
+          try {
+            const finalStatus = await client.getTaskStatus(
+              taskId,
+              {
+                logFrom: nextLogIndex,
+                logLimit: 1000,
+              },
+              {
+                maxAttempts: 1,
+                timeoutMs: 30000,
+              },
+            );
+            const finalLogs = Array.isArray(finalStatus.logs)
+              ? finalStatus.logs
+              : [];
+            if (finalLogs.length > 0) {
+              finalLogs.forEach((logLine) => {
+                if (!logLine) return;
+                handleRemoteLogLine(logLine, "poll");
+              });
+            }
+          } catch (finalStatusError) {
+            emitRemoteLog(
+              "System: Failed to fetch trailing remote logs after completion. Continuing with result download.",
+              "warn",
+            );
           }
         }
         await client.downloadResult(taskId, outputPath);
-        // [Fix Bug 8] 尝试下载缓存文件（用于校对）
+        // [Fix Bug 8] 尝试下载缓存文件（用于校对）。
         try {
           const cachePath = outputPath + ".cache.json";
           await client.downloadCache(taskId, cachePath);
         } catch (e) {
-          // 缓存下载失败不影响主流程
+          // 缓存下载失败不影响主流程。
         }
         appendRemoteMirrorMessage({
           taskId,
@@ -4759,7 +5666,7 @@ const runTranslationViaRemoteApi = async (
         return;
       }
 
-      // 动态轮询：运行中快速获取进度(200ms)，空闲/排队时节省资源(1000ms)
+      // 动态轮询：运行中用 200ms，空闲或排队时用 1000ms。
       const pollDelay = status.status === "running" ? 200 : 1000;
       await new Promise((resolve) => setTimeout(resolve, pollDelay));
     }
@@ -4780,6 +5687,12 @@ const runTranslationViaRemoteApi = async (
       level: "error",
       message: `Remote translation failed. ${message}`,
     });
+    if (taskId && !stopRequested && !completionPhase) {
+      emitRemoteLog(
+        `System: Remote status polling failed while task is active. The task will keep running on the server and the client will stop local tracking after this error (${taskId}).`,
+        "warn",
+      );
+    }
     event.reply("process-exit", {
       code: 1,
       signal: null,
@@ -4807,10 +5720,29 @@ const runTranslationViaRemoteApi = async (
 ipcMain.on(
   "start-translation",
   async (event, { inputFile, modelPath, config, runId }) => {
-    if (pythonProcess || remoteTranslationBridge) return; // Already running
+    const requestedRunId = normalizeRunId(runId) || randomUUID();
+    if (
+      pythonProcess ||
+      remoteTranslationBridge ||
+      translationStartInProgress ||
+      isPipelineV2RunnerBusy()
+    ) {
+      replyLogUpdate(event, "WARN: Translation already running", {
+        level: "warn",
+        source: "main",
+        runId: requestedRunId,
+      });
+      event.reply("process-exit", {
+        code: 1,
+        signal: null,
+        stopRequested: false,
+        runId: requestedRunId,
+      });
+      return;
+    }
+    translationStartInProgress = true;
     translationStopRequested = false;
-    activeRunId =
-      typeof runId === "string" && runId.trim() ? runId.trim() : randomUUID();
+    activeRunId = requestedRunId;
 
     const middlewareDir = getMiddlewarePath();
     const tempRuleFiles: string[] = [];
@@ -4823,22 +5755,62 @@ ipcMain.on(
         }
       }
     };
+    const failStartAndExit = (message: string) => {
+      replyLogUpdate(event, message, {
+        level: "error",
+        source: "main",
+        runId: requestedRunId,
+      });
+      replyJsonLog(
+        event,
+        "JSON_ERROR:",
+        {
+          title: "Start Translation Failed",
+          message,
+        },
+        {
+          level: "error",
+          source: "main",
+          runId: requestedRunId,
+        },
+      );
+      event.reply("process-exit", {
+        code: 1,
+        signal: null,
+        stopRequested: false,
+        runId: requestedRunId,
+      });
+      cleanupTempRuleFiles();
+      translationStartInProgress = false;
+      translationStopRequested = false;
+      clearActiveRunIfMatch(requestedRunId);
+    };
+    const abortStartIfStopRequested = (): boolean => {
+      if (!translationStopRequested) return false;
+      event.reply("process-exit", {
+        code: 1,
+        signal: null,
+        stopRequested: true,
+        runId: requestedRunId,
+      });
+      cleanupTempRuleFiles();
+      translationStartInProgress = false;
+      translationStopRequested = false;
+      clearActiveRunIfMatch(requestedRunId);
+      return true;
+    };
     // Use the proper translator script
     const scriptPath = join(middlewareDir, "murasaki_translator", "main.py");
 
     if (!fs.existsSync(scriptPath)) {
-      replyLogUpdate(event, `ERR: Script not found at ${scriptPath}`, {
-        level: "error",
-        source: "main",
-      });
-      activeRunId = null;
+      failStartAndExit(`ERR: Script not found at ${scriptPath}`);
       return;
     }
 
     const pythonCmd = getPythonPath();
     console.log("Using Python:", pythonCmd);
 
-    // 使用跨平台检测获取正确的二进制路径
+    // 使用跨平台检测获取正确的二进制路径。
     let serverExePath: string;
     try {
       const platformInfo = detectPlatform();
@@ -4850,11 +5822,7 @@ ipcMain.on(
       serverExePath = getLlamaServerPath();
     } catch (e: unknown) {
       const errorMsg = e instanceof Error ? e.message : String(e);
-      replyLogUpdate(event, `ERR: ${errorMsg}`, {
-        level: "error",
-        source: "main",
-      });
-      activeRunId = null;
+      failStartAndExit(`ERR: ${errorMsg}`);
       return;
     }
 
@@ -4877,8 +5845,8 @@ ipcMain.on(
           ? "connected-local-daemon"
           : "connected-remote-session";
     } else if (daemonConnection?.url && config?.executionMode === "remote") {
-      // 仅当用户明确选择远程模式时才为本地 daemon 创建 RemoteClient。
-      // 本地翻译不走 HTTP API 桥接，避免轮询延迟导致的性能回退。
+      // 仅当用户明确选择远程模式时，才为本地 daemon 创建 RemoteClient。
+      // 本地翻译不走 HTTP API 桥接，避免轮询延迟带来的性能回退。
       remoteExecutionClient = new RemoteClient(
         {
           url: daemonConnection.url,
@@ -4933,16 +5901,25 @@ ipcMain.on(
     ).trim();
 
     if (remoteExecutionClient) {
-      await runTranslationViaRemoteApi(event, {
-        client: remoteExecutionClient,
-        sourceLabel: remoteExecutionSource,
-        inputFile,
-        effectiveModelPath: effectiveRemoteModelPath,
-        config,
-        isExternalRemote,
-        runId: activeRunId,
-      });
-      activeRunId = null;
+      if (abortStartIfStopRequested()) {
+        return;
+      }
+      try {
+        await runTranslationViaRemoteApi(event, {
+          client: remoteExecutionClient,
+          sourceLabel: remoteExecutionSource,
+          inputFile,
+          effectiveModelPath: effectiveRemoteModelPath,
+          config,
+          isExternalRemote,
+          runId: requestedRunId,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failStartAndExit(`ERR: Remote execution crashed unexpectedly: ${message}`);
+      }
+      translationStartInProgress = false;
+      clearActiveRunIfMatch(requestedRunId);
       return;
     }
 
@@ -5001,16 +5978,13 @@ ipcMain.on(
 
     if (!effectiveModelPath || !fs.existsSync(effectiveModelPath)) {
       console.error("[start-translation] Model not found, returning early");
-      replyLogUpdate(event, `ERR: Model not found at ${effectiveModelPath}`, {
-        level: "error",
-        source: "main",
-      });
+      failStartAndExit(`ERR: Model not found at ${effectiveModelPath}`);
       return;
     }
 
     console.log("[start-translation] Model check passed, building args...");
 
-    // serverExePath 已在上面的 try-catch 中验证
+    // serverExePath 已在上面的 try-catch 中验证。
     // Build args for murasaki_translator/main.py
     const args = [
       join("murasaki_translator", "main.py"),
@@ -5043,22 +6017,8 @@ ipcMain.on(
       const sm = ServerManager.getInstance();
       const status = sm.getStatus();
 
-      if (status.running && status.mode !== "api_v1") {
-        // 非 api_v1 daemon：直接连接其 llama-server 端口
-        args.push("--server", `http://127.0.0.1:${status.port}`);
-        args.push("--no-server-spawn");
-        console.log(
-          "[start-translation] Using local daemon server on port",
-          status.port,
-        );
-        replyLogUpdate(
-          event,
-          `System: Connected to local daemon on port ${status.port}`,
-          { level: "info", source: "main" },
-        );
-      } else if (status.running && status.mode === "api_v1") {
-        // api_v1 daemon：API server 端口与 llama-server 协议不兼容，
-        // 回退到标准 spawn（main.py 自行启动 llama-server）
+      if (status.running) {
+        // Local daemon currently exposes api_v1; run direct llama-server path.
         console.log(
           "[start-translation] api_v1 daemon detected, using direct spawn for performance.",
         );
@@ -5069,7 +6029,6 @@ ipcMain.on(
         );
         args.push("--server", serverExePath);
       } else {
-        // Daemon 未运行，回退到标准 spawn
         args.push("--server", serverExePath);
       }
     } else {
@@ -5083,7 +6042,7 @@ ipcMain.on(
         args.push("--gpu-layers", "0");
         console.log("Mode: CPU Only (Forced gpu-layers 0)");
       } else {
-        // 默认使用 -1（尽可能加载到 GPU），若用户指定则使用用户值
+        // 默认使用 -1（尽可能加载到 GPU），用户指定时使用用户值。
         const gpuLayers =
           config.gpuLayers !== undefined ? config.gpuLayers : -1;
         args.push("--gpu-layers", gpuLayers.toString());
@@ -5203,7 +6162,7 @@ ipcMain.on(
         );
         args.push(
           "--line-tolerance-pct",
-          ((config.lineTolerancePct ?? 20) / 100).toString(),
+          normalizeLineTolerancePct(config.lineTolerancePct, 0.2).toString(),
         );
       }
       if (config.anchorCheck) {
@@ -5292,8 +6251,13 @@ ipcMain.on(
       }
     }
 
-    console.log("Spawning:", pythonCmd, args.join(" "), "in", middlewareDir);
-    replyLogUpdate(event, `System: CMD: ${pythonCmd} ${args.join(" ")}`, {
+    if (abortStartIfStopRequested()) {
+      return;
+    }
+
+    const systemCmdForLog = formatSystemCommandForLog(pythonCmd, args);
+    console.log("Spawning:", systemCmdForLog, "in", middlewareDir);
+    replyLogUpdate(event, `System: CMD: ${systemCmdForLog}`, {
       level: "info",
       source: "main",
     });
@@ -5309,25 +6273,50 @@ ipcMain.on(
 
     // Set GPU ID if specified and not in CPU mode
     const customEnv: NodeJS.ProcessEnv = {};
-    if (config?.deviceMode !== "cpu" && config?.gpuDeviceId) {
-      customEnv["CUDA_VISIBLE_DEVICES"] = config.gpuDeviceId;
-      console.log(`Setting CUDA_VISIBLE_DEVICES=${config.gpuDeviceId}`);
+    const normalizedGpuDeviceId = normalizeCudaVisibleDevices(
+      config?.gpuDeviceId,
+    );
+    if (config?.deviceMode !== "cpu" && normalizedGpuDeviceId) {
+      customEnv["CUDA_VISIBLE_DEVICES"] = normalizedGpuDeviceId;
+      console.log(`Setting CUDA_VISIBLE_DEVICES=${normalizedGpuDeviceId}`);
       replyLogUpdate(
         event,
-        `System: CUDA_VISIBLE_DEVICES=${config.gpuDeviceId}`,
+        `System: CUDA_VISIBLE_DEVICES=${normalizedGpuDeviceId}`,
         { level: "info", source: "main" },
       );
     }
 
     try {
-      pythonProcess = spawnPythonProcess(pythonCmd, args, {
+      const launchedProcess = spawnPythonProcess(pythonCmd, args, {
         cwd: middlewareDir,
         env: customEnv,
         stdio: ["ignore", "pipe", "pipe"],
       });
+      const launchedRunId = requestedRunId;
+      pythonProcess = launchedProcess;
+      translationStartInProgress = false;
+      if (translationStopRequested) {
+        requestStopForLocalTranslationProcess(launchedProcess);
+      }
 
       let stdoutBuffer = "";
       let stderrBuffer = "";
+      let hasReportedExit = false;
+
+      const reportProcessExit = (
+        code: number | null,
+        signal: NodeJS.Signals | null,
+        stopRequested: boolean,
+      ) => {
+        if (hasReportedExit) return;
+        hasReportedExit = true;
+        event.reply("process-exit", {
+          code,
+          signal,
+          stopRequested,
+          runId: launchedRunId,
+        });
+      };
 
       const flushBufferedLines = (
         buffer: string,
@@ -5387,21 +6376,38 @@ ipcMain.on(
         }
       };
 
-      pythonProcess.on("error", (err) => {
+      launchedProcess.on("error", (err) => {
         console.error("Spawn Error:", err);
-        replyLogUpdate(
+        const errorMessage = `CRITICAL ERROR: Failed to spawn python. ${err.message}`;
+        replyLogUpdate(event, errorMessage, {
+          level: "critical",
+          source: "main",
+        });
+        replyJsonLog(
           event,
-          `CRITICAL ERROR: Failed to spawn python. ${err.message}`,
-          { level: "critical", source: "main" },
+          "JSON_ERROR:",
+          {
+            title: "Start Translation Failed",
+            message: errorMessage,
+          },
+          {
+            level: "critical",
+            source: "main",
+            runId: launchedRunId,
+          },
         );
         cleanupTempRuleFiles();
+        translationStartInProgress = false;
         translationStopRequested = false;
-        pythonProcess = null;
-        activeRunId = null;
+        if (pythonProcess === launchedProcess) {
+          pythonProcess = null;
+        }
+        reportProcessExit(1, null, false);
+        clearActiveRunIfMatch(launchedRunId);
       });
 
-      if (pythonProcess.stdout) {
-        pythonProcess.stdout.on("data", (data) => {
+      if (launchedProcess.stdout) {
+        launchedProcess.stdout.on("data", (data) => {
           const str = data.toString();
           console.log("STDOUT:", str);
           stdoutBuffer += str;
@@ -5410,8 +6416,8 @@ ipcMain.on(
         });
       }
 
-      if (pythonProcess.stderr) {
-        pythonProcess.stderr.on("data", (data) => {
+      if (launchedProcess.stderr) {
+        launchedProcess.stderr.on("data", (data) => {
           const str = data.toString();
           stderrBuffer += str;
           const flushed = flushBufferedLines(stderrBuffer, handleStderrLine);
@@ -5419,7 +6425,7 @@ ipcMain.on(
         });
       }
 
-      pythonProcess.on("close", (code, signal) => {
+      launchedProcess.on("close", (code, signal) => {
         if (stdoutBuffer.trim()) {
           flushBufferedLines(`${stdoutBuffer}\n`, handleStdoutLine);
         }
@@ -5427,29 +6433,27 @@ ipcMain.on(
           flushBufferedLines(`${stderrBuffer}\n`, handleStderrLine);
         }
         const stopRequested = translationStopRequested;
+        translationStartInProgress = false;
         translationStopRequested = false;
-        const exitRunId = activeRunId;
         console.log(
           `[Translation] Process exited (code=${String(code)}, signal=${String(signal)}, stopRequested=${stopRequested})`,
         );
-        event.reply("process-exit", {
-          code,
-          signal,
-          stopRequested,
-          runId: exitRunId || undefined,
-        });
-        pythonProcess = null;
-        activeRunId = null;
+        reportProcessExit(code, signal as NodeJS.Signals | null, stopRequested);
+        if (pythonProcess === launchedProcess) {
+          pythonProcess = null;
+        }
+        clearActiveRunIfMatch(launchedRunId);
         cleanupTempRuleFiles();
       });
     } catch (e: unknown) {
+      translationStartInProgress = false;
       const errorMsg = e instanceof Error ? e.message : String(e);
-      replyLogUpdate(event, `Exception: ${errorMsg}`, {
-        level: "error",
-        source: "main",
-      });
-      cleanupTempRuleFiles();
-      activeRunId = null;
+      try {
+        pythonProcess?.kill();
+      } catch {
+        // ignore kill failures during setup rollback
+      }
+      failStartAndExit(`Exception: ${errorMsg}`);
       console.error(e);
     }
   },
@@ -5461,40 +6465,15 @@ ipcMain.on("stop-translation", () => {
     return;
   }
 
-  if (pythonProcess) {
-    translationStopRequested = true;
-    const pid = pythonProcess.pid;
-    console.log(`[Stop] Stopping translation process with PID: ${pid}`);
-
-    if (process.platform === "win32" && pid) {
-      console.log(`[Stop] Executing async: taskkill /pid ${pid} /f /t`);
-      const killProc = spawn("taskkill", ["/pid", pid.toString(), "/f", "/t"], {
-        stdio: "pipe",
-        windowsHide: true,
-      });
-      killProc.on("close", (code) => {
-        console.log(`[Stop] taskkill exited with code ${code}`);
-      });
-      killProc.on("error", (err) => {
-        console.error("[Stop] taskkill spawn error:", err.message);
-        // Fallback
-        try {
-          pythonProcess?.kill();
-        } catch (_) {}
-      });
-      // 超时兜底：3s 后若进程仍然存活
-      setTimeout(() => {
-        try {
-          pythonProcess?.kill("SIGKILL");
-        } catch (_) {}
-      }, 3000);
-    } else {
-      pythonProcess.kill();
+  if (!pythonProcess) {
+    if (translationStartInProgress) {
+      translationStopRequested = true;
     }
+    return;
+  }
 
-    pythonProcess = null;
-
-    console.log("[Stop] Translation process stopped signal sent");
+  if (pythonProcess) {
+    requestStopForLocalTranslationProcess(pythonProcess);
   }
 });
 
@@ -5577,7 +6556,9 @@ ipcMain.handle(
           if (tempFile && fs.existsSync(tempFile)) {
             try {
               fs.unlinkSync(tempFile);
-            } catch (_) {}
+            } catch {
+              // ignore temp input cleanup failure
+            }
           }
 
           if (code === 0) {
@@ -5740,13 +6721,14 @@ ipcMain.handle(
       return { success: false };
     }
 
-    // 单例保护：防止并发下载导致孤儿进程
+    // 单例保护：防止并发下载导致孤儿进程。
     if (hfDownloadProcess !== null) {
       console.warn(
         "[HF Download] Download already in progress, rejecting new request",
       );
       event.sender.send("hf-download-error", {
-        message: "已有下载任务进行中，请等待完成或取消后再试",
+        message:
+          "Another download task is already running. Wait for completion or cancel it first.",
       });
       return { success: false, error: "Download already in progress" };
     }
@@ -5885,7 +6867,9 @@ ipcMain.handle("hf-download-cancel", async () => {
       } catch {
         try {
           hfDownloadProcess.kill();
-        } catch {}
+        } catch {
+          // ignore cancel fallback kill failure
+        }
       }
     } else {
       hfDownloadProcess.kill("SIGTERM");

@@ -5,8 +5,7 @@ import {
   isProofreadV2LineCache,
   normalizeProofreadEngineMode,
   normalizeProofreadChunkType,
-  parseLegacyActivePipelineId,
-  resolveProofreadPipelineId,
+  resolveAvailableProofreadPipelineId,
   resolveProofreadRetranslateOptions,
 } from "../proofreadViewConfig";
 
@@ -16,29 +15,6 @@ describe("normalizeProofreadEngineMode", () => {
     expect(normalizeProofreadEngineMode(" v2 ")).toBe("v2");
     expect(normalizeProofreadEngineMode("v1")).toBe("v1");
     expect(normalizeProofreadEngineMode(undefined)).toBe("v1");
-  });
-});
-
-describe("parseLegacyActivePipelineId", () => {
-  it("parses json string payload", () => {
-    expect(parseLegacyActivePipelineId('"pipeline_1"')).toBe("pipeline_1");
-  });
-
-  it("returns empty string on invalid payload", () => {
-    expect(parseLegacyActivePipelineId("not-json")).toBe("");
-    expect(parseLegacyActivePipelineId("")).toBe("");
-  });
-});
-
-describe("resolveProofreadPipelineId", () => {
-  it("prefers primary pipeline id", () => {
-    expect(resolveProofreadPipelineId("pipeline_main", '"fallback"')).toBe(
-      "pipeline_main",
-    );
-  });
-
-  it("falls back to legacy payload", () => {
-    expect(resolveProofreadPipelineId("", '"fallback"')).toBe("fallback");
   });
 });
 
@@ -52,14 +28,33 @@ describe("resolveProofreadRetranslateOptions", () => {
     ).toEqual({ useV2: false, pipelineId: "" });
   });
 
-  it("returns v2 options and resolved pipeline id", () => {
+  it("returns trimmed pipeline id for v2 mode", () => {
     expect(
       resolveProofreadRetranslateOptions({
         engineMode: "v2",
-        pipelineId: "",
-        legacyPipelineRaw: '"pipeline_fallback"',
+        pipelineId: " pipeline_current ",
       }),
-    ).toEqual({ useV2: true, pipelineId: "pipeline_fallback" });
+    ).toEqual({ useV2: true, pipelineId: "pipeline_current" });
+  });
+});
+
+describe("resolveAvailableProofreadPipelineId", () => {
+  it("prefers the first valid candidate", () => {
+    expect(
+      resolveAvailableProofreadPipelineId({
+        availablePipelineIds: ["ds", "claude"],
+        candidates: ["deepseek", " ds ", "claude"],
+      }),
+    ).toBe("ds");
+  });
+
+  it("returns empty string when no candidate is valid", () => {
+    expect(
+      resolveAvailableProofreadPipelineId({
+        availablePipelineIds: ["ds"],
+        candidates: ["deepseek", ""],
+      }),
+    ).toBe("");
   });
 });
 
@@ -107,15 +102,16 @@ describe("buildProofreadAlignedLinePairs", () => {
 });
 
 describe("normalizeProofreadChunkType", () => {
-  it("normalizes known chunk types", () => {
+  it("normalizes supported chunk types", () => {
     expect(normalizeProofreadChunkType("line")).toBe("line");
     expect(normalizeProofreadChunkType(" chunk ")).toBe("chunk");
-    expect(normalizeProofreadChunkType("legacy")).toBe("block");
+    expect(normalizeProofreadChunkType("block")).toBe("block");
   });
 
-  it("returns empty string for unknown values", () => {
+  it("returns empty string for unsupported values", () => {
     expect(normalizeProofreadChunkType("")).toBe("");
     expect(normalizeProofreadChunkType("foo")).toBe("");
+    expect(normalizeProofreadChunkType("legacy")).toBe("");
     expect(normalizeProofreadChunkType(undefined)).toBe("");
   });
 });

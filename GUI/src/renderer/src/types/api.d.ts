@@ -26,7 +26,7 @@ export interface TranslationConfig {
   saveCot: boolean;
   saveSummary: boolean;
   deviceMode: "auto" | "cpu" | "gpu" | "rocm";
-  gpuDeviceId: number;
+  gpuDeviceId: number | string;
   repPenaltyBase: number;
   repPenaltyMax: number;
   repPenaltyStep: number;
@@ -97,6 +97,18 @@ export interface CacheData {
     dstChars: number;
   };
   blocks: CacheBlock[];
+}
+
+export interface HistoryRecordDetail {
+  logs: string[];
+  triggers: Array<{
+    time?: string;
+    type?: string;
+    block?: number;
+    line?: number;
+    message?: string;
+  }>;
+  llamaLogs: string[];
 }
 
 /** V2 行模式缓存行 */
@@ -284,20 +296,34 @@ export interface ApiStatsOverview {
   failedRequests: number;
   inflightRequests: number;
   successRate: number;
+  failureRate: number;
   totalRetries: number;
+  avgRetriesPerRequest: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  totalTokens: number;
+  outputInputRatio: number;
   avgLatencyMs: number;
   p50LatencyMs: number;
   p95LatencyMs: number;
+  fastestLatencyMs: number;
+  slowestLatencyMs: number;
   totalDurationMs: number;
   requestsPerMinuteAvg: number;
   peakRequestsPerMinute: number;
+  status2xx: number;
+  status4xx: number;
+  status5xx: number;
+  statusOther: number;
+  statusUnknown: number;
   statusCodeCounts: Record<string, number>;
   sourceCounts: Record<string, number>;
   errorTypeCounts: Record<string, number>;
   byHour: Array<{ hour: number; count: number }>;
+  firstRequestAt?: string;
   latestRequestAt?: string;
+  observationWindowMs: number;
+  observationWindowMinutes: number;
 }
 
 export interface ApiStatsTrendPoint {
@@ -312,7 +338,13 @@ export interface ApiStatsTrendPoint {
 export interface ApiStatsTrend {
   apiProfileId: string;
   range?: { fromTs?: string; toTs?: string };
-  metric: "requests" | "latency" | "input_tokens" | "output_tokens";
+  metric:
+    | "requests"
+    | "latency"
+    | "input_tokens"
+    | "output_tokens"
+    | "error_rate"
+    | "success_rate";
   interval: "minute" | "hour" | "day";
   points: ApiStatsTrendPoint[];
 }
@@ -326,7 +358,13 @@ export interface ApiStatsBreakdownItem {
 export interface ApiStatsBreakdown {
   apiProfileId: string;
   range?: { fromTs?: string; toTs?: string };
-  dimension: "status_code" | "source" | "error_type" | "model" | "hour";
+  dimension:
+    | "status_code"
+    | "status_class"
+    | "source"
+    | "error_type"
+    | "model"
+    | "hour";
   items: ApiStatsBreakdownItem[];
 }
 
@@ -357,6 +395,7 @@ export interface ApiStatsRecord {
   responsePayload?: unknown;
   requestHeaders?: Record<string, string>;
   responseHeaders?: Record<string, string>;
+  meta?: Record<string, unknown>;
 }
 
 export interface ApiStatsRecords {
@@ -394,6 +433,7 @@ export interface ElectronAPI {
     arg: string | { filename: string; content?: string },
   ) => Promise<{ success: boolean; path?: string; error?: string }>;
   getModelInfo: (modelName: string) => Promise<any>;
+  reportActiveView: (view: string) => void;
 
   // File Operations
   selectFile: (options?: {
@@ -427,11 +467,38 @@ export interface ElectronAPI {
   checkOutputFileExists: (
     inputFile: string,
     config: any,
-  ) => Promise<{ exists: boolean; path?: string; isCache?: boolean }>;
+  ) => Promise<{
+    exists: boolean;
+    path?: string;
+    isCache?: boolean;
+    resumeOutputPath?: string;
+    remoteCheckSkipped?: boolean;
+    remoteHost?: string;
+  }>;
+  clipboardWrite: (text: string) => Promise<{ ok: boolean; error?: string }>;
 
   // Cache Operations
   loadCache: (path: string) => Promise<any>;
-  saveCache: (path: string, data: any) => Promise<boolean>;
+  saveCache: (
+    path: string,
+    data: any,
+  ) => Promise<
+    | boolean
+    | {
+        ok: boolean;
+        path?: string;
+        error?: string;
+        warning?: string;
+      }
+  >;
+  historyDetailLoad: (id: string) => Promise<HistoryRecordDetail | null>;
+  historyDetailSave: (
+    id: string,
+    detail: HistoryRecordDetail,
+  ) => Promise<boolean>;
+  historyDetailDelete: (id: string) => Promise<boolean>;
+  historyDetailPrune: (allowedIds: string[]) => Promise<boolean>;
+  historyDetailClearAll: () => Promise<boolean>;
   rebuildDoc: (options: {
     cachePath: string;
     outputPath?: string;
@@ -526,14 +593,26 @@ export interface ElectronAPI {
   }) => Promise<ApiStatsResult<ApiStatsOverview>>;
   apiStatsTrend: (payload: {
     apiProfileId?: string;
-    metric?: "requests" | "latency" | "input_tokens" | "output_tokens";
+    metric?:
+      | "requests"
+      | "latency"
+      | "input_tokens"
+      | "output_tokens"
+      | "error_rate"
+      | "success_rate";
     interval?: "minute" | "hour" | "day";
     fromTs?: string;
     toTs?: string;
   }) => Promise<ApiStatsResult<ApiStatsTrend>>;
   apiStatsBreakdown: (payload: {
     apiProfileId?: string;
-    dimension?: "status_code" | "source" | "error_type" | "model" | "hour";
+    dimension?:
+      | "status_code"
+      | "status_class"
+      | "source"
+      | "error_type"
+      | "model"
+      | "hour";
     fromTs?: string;
     toTs?: string;
   }) => Promise<ApiStatsResult<ApiStatsBreakdown>>;
@@ -889,9 +968,16 @@ export interface ElectronAPI {
   hfCheckNetwork: () => Promise<any>;
 }
 
+export interface ToolkitElectronAPI {
+  webUtils: {
+    getPathForFile: (file: File) => string;
+  };
+}
+
 declare global {
   interface Window {
     api: ElectronAPI;
+    electron: ToolkitElectronAPI;
   }
 }
 

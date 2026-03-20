@@ -37,6 +37,7 @@ import {
   Upload,
 } from "lucide-react";
 import { Button, Card, Switch, Input, Tooltip as UITooltip } from "./ui/core";
+import { Select } from "./ui/Select";
 import { FileIcon } from "./ui/FileIcon";
 import { AlertModal } from "./ui/AlertModal";
 import { useAlertModal } from "../hooks/useAlertModal";
@@ -52,6 +53,11 @@ import { buildQueueExport, parseQueueExport } from "../lib/queueExport";
 import { formatGlobalValue } from "../lib/formatting";
 import { APP_CONFIG } from "../lib/config";
 import { emitToast } from "../lib/toast";
+import {
+  loadLibraryQueueWithLegacyMigration,
+  persistLibraryQueue,
+} from "../lib/libraryQueueStorage";
+import { extractElectronDragPaths } from "../lib/dragDropPaths";
 import {
   filterWatchFilesByTypes,
   isLikelyTranslatedOutput,
@@ -82,10 +88,8 @@ interface QueueImportPreview {
 
 // ============ Constants ============
 
-const LIBRARY_QUEUE_KEY = "library_queue";
-const FILE_QUEUE_KEY = "file_queue";
 const WATCH_FOLDERS_KEY = "watch_folders";
-const SUPPORTED_EXTENSIONS = [".txt", ".epub", ".srt", ".ass", ".ssa"];
+const SUPPORTED_EXTENSIONS = [".txt", ".epub", ".srt", ".ass", ".ssa", ".xlsx"];
 const WATCH_FILE_TYPES = SUPPORTED_EXTENSIONS.map((ext) =>
   ext.replace(".", ""),
 );
@@ -215,7 +219,7 @@ const texts = {
     confirmRemoveDesc: "确定要从队列中移除此文件吗？",
     confirmRemoveSelectedTitle: "确认移除已选",
     confirmRemoveSelectedDesc: "确定要移除选中的 {count} 个文件吗？",
-    supportedTypes: "支持 .txt .epub .srt .ass .ssa",
+    supportedTypes: "支持 .txt .epub .srt .ass .ssa .xlsx",
     queueTitle: "翻译队列",
     emptyQueue: "队列为空",
     emptyHint: "拖放文件到上方区域，或点击按钮选择",
@@ -393,7 +397,7 @@ const texts = {
     confirmRemoveSelectedTitle: "Confirm Remove Selected",
     confirmRemoveSelectedDesc:
       "Are you sure you want to remove the {count} selected files?",
-    supportedTypes: "Supports .txt .epub .srt .ass .ssa",
+    supportedTypes: "Supports .txt .epub .srt .ass .ssa .xlsx",
     queueTitle: "Translation Queue",
     emptyQueue: "Queue is empty",
     emptyHint: "Drop files above, or click buttons to select",
@@ -567,7 +571,7 @@ const texts = {
     confirmRemoveDesc: "このファイルをキューから削除しますか？",
     confirmRemoveSelectedTitle: "選択削除の確認",
     confirmRemoveSelectedDesc: "選択した {count} 件のファイルを削除しますか？",
-    supportedTypes: ".txt .epub .srt .ass .ssa に対応",
+    supportedTypes: ".txt .epub .srt .ass .ssa .xlsx に対応",
     queueTitle: "翻訳キュー",
     emptyQueue: "キューが空です",
     emptyHint: "上にファイルをドロップ、またはボタンで選択",
@@ -753,7 +757,7 @@ export function FileConfigModal({
   const globalOutputDir = localStorage.getItem("config_output_dir") || "";
   const globalCtx = localStorage.getItem("config_ctx") || "4096";
   const globalConcurrency = localStorage.getItem("config_concurrency") || "1";
-  const globalTemp = localStorage.getItem("config_temperature") || "0.7";
+  const globalTemp = localStorage.getItem("config_temperature") || "0.3";
   const globalGpu = localStorage.getItem("config_gpu") || "-1";
   const globalPreset = localStorage.getItem("config_preset") || "novel";
   const globalModel = isRemoteMode
@@ -772,6 +776,12 @@ export function FileConfigModal({
     localStorage.getItem("config_rules_pre_active_profile") || "";
   const globalPostProfileId =
     localStorage.getItem("config_rules_post_active_profile") || "";
+  const globalV2PipelineId =
+    localStorage.getItem("config_v2_pipeline_id") || "";
+  const globalV2PipelineName =
+    v2Profiles.find((profile) => profile.id === globalV2PipelineId)?.name ||
+    globalV2PipelineId ||
+    t.notSet;
 
   useEffect(() => {
     setPreProfiles(loadRuleProfiles("pre"));
@@ -790,8 +800,7 @@ export function FileConfigModal({
     const loadModels = async () => {
       if (isRemoteMode) {
         try {
-          // @ts-ignore
-          const result = await window.api?.remoteModels?.();
+          const result = await (window.api as any)?.remoteModels?.();
           if (!alive) return;
           if (result?.ok && Array.isArray(result.data)) {
             const mapped = result.data
@@ -972,23 +981,21 @@ export function FileConfigModal({
               </div>
             </div>
 
-            {/* Right: useGlobal toggle (local only) + Close */}
+            {/* Right: useGlobal toggle + Close */}
             <div className="flex items-center gap-3 shrink-0">
-              {!isApiMode && (
-                <label className="flex items-center gap-2 cursor-pointer select-none">
-                  <span
-                    className={`text-xs font-medium ${config.useGlobalDefaults ? "text-primary" : "text-muted-foreground"}`}
-                  >
-                    {t.useGlobal}
-                  </span>
-                  <Switch
-                    checked={config.useGlobalDefaults}
-                    onCheckedChange={(c) =>
-                      setConfig((prev) => ({ ...prev, useGlobalDefaults: c }))
-                    }
-                  />
-                </label>
-              )}
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <span
+                  className={`text-xs font-medium ${config.useGlobalDefaults ? "text-primary" : "text-muted-foreground"}`}
+                >
+                  {t.useGlobal}
+                </span>
+                <Switch
+                  checked={config.useGlobalDefaults}
+                  onCheckedChange={(c) =>
+                    setConfig((prev) => ({ ...prev, useGlobalDefaults: c }))
+                  }
+                />
+              </label>
               <button
                 onClick={onClose}
                 className="p-1.5 rounded-md hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
@@ -1036,26 +1043,47 @@ export function FileConfigModal({
                       <Info className="w-3 h-3 text-muted-foreground/50 hover:text-primary cursor-help" />
                     </UITooltip>
                   </label>
+                  <span className="text-[10px] text-muted-foreground/50 tabular-nums">
+                    {t.currentGlobal}: {globalV2PipelineName}
+                  </span>
                 </div>
                 {v2Profiles.length > 0 ? (
-                  <select
-                    value={config.v2PipelineId || ""}
+                  <Select
+                    value={
+                      !config.useGlobalDefaults && config.v2PipelineId
+                        ? config.v2PipelineId
+                        : ""
+                    }
                     onChange={(e) =>
                       setConfig((prev) => ({
                         ...prev,
                         v2PipelineId: e.target.value || undefined,
                       }))
                     }
-                    className="w-full h-8 px-2.5 text-sm rounded-md border transition-all outline-none bg-background/50 border-border focus:ring-2 focus:ring-primary/20 focus:border-primary/50"
+                    disabled={config.useGlobalDefaults}
+                    className={`w-full h-8 px-2.5 text-sm rounded-md border transition-all outline-none ${
+                      config.useGlobalDefaults
+                        ? "bg-secondary/30 border-transparent text-muted-foreground/50 cursor-not-allowed"
+                        : "bg-background/50 border-border focus:ring-2 focus:ring-primary/20 focus:border-primary/50"
+                    }`}
                   >
-                    <option value="">{t.selectPipeline}</option>
+                    <option
+                      value=""
+                      disabled={
+                        !config.useGlobalDefaults && Boolean(config.v2PipelineId)
+                      }
+                    >
+                      {config.useGlobalDefaults
+                        ? globalV2PipelineName
+                        : t.selectPipeline}
+                    </option>
                     {v2Profiles.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name}
                         {p.providerName ? ` (${p.providerName})` : ""}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                 ) : (
                   <p className="text-xs text-muted-foreground/70 italic py-2">
                     {t.noPipelines}
@@ -1096,7 +1124,7 @@ export function FileConfigModal({
                     {t.currentGlobal}: {globalPreset}
                   </span>
                 </div>
-                <select
+                <Select
                   value={
                     !config.useGlobalDefaults && config.preset
                       ? config.preset
@@ -1127,7 +1155,7 @@ export function FileConfigModal({
                   <option value="novel">{t.presetOptions.novel}</option>
                   <option value="script">{t.presetOptions.script}</option>
                   <option value="short">{t.presetOptions.short}</option>
-                </select>
+                </Select>
               </div>
 
               <div className="space-y-1.5">
@@ -1143,7 +1171,7 @@ export function FileConfigModal({
                     {globalModel ? globalModel.split(/[/\\]/).pop() : t.notSet}
                   </span>
                 </div>
-                <select
+                <Select
                   value={
                     config.useGlobalDefaults
                       ? ""
@@ -1185,7 +1213,7 @@ export function FileConfigModal({
                           {model.replace(".gguf", "")}
                         </option>
                       ))}
-                </select>
+                </Select>
               </div>
 
               {!config.useGlobalDefaults && config.preset === "short" && (
@@ -1217,7 +1245,7 @@ export function FileConfigModal({
                     {t.currentGlobal}: {globalPreProfileName}
                   </span>
                 </div>
-                <select
+                <Select
                   value={
                     !config.useGlobalDefaults && config.rulesPreProfileId
                       ? config.rulesPreProfileId
@@ -1249,7 +1277,7 @@ export function FileConfigModal({
                       {profile.name}
                     </option>
                   ))}
-                </select>
+                </Select>
               </div>
 
               <div className="space-y-1.5">
@@ -1264,7 +1292,7 @@ export function FileConfigModal({
                     {t.currentGlobal}: {globalPostProfileName}
                   </span>
                 </div>
-                <select
+                <Select
                   value={
                     !config.useGlobalDefaults && config.rulesPostProfileId
                       ? config.rulesPostProfileId
@@ -1296,7 +1324,7 @@ export function FileConfigModal({
                       {profile.name}
                     </option>
                   ))}
-                </select>
+                </Select>
               </div>
             </div>
           </div>
@@ -1378,12 +1406,15 @@ export function FileConfigModal({
                     icon={Zap}
                     label={t.temperature}
                     value={config.temperature}
-                    onChange={(val) =>
+                    onChange={(val) => {
+                      const parsed = parseFloat(val);
                       setConfig((prev) => ({
                         ...prev,
-                        temperature: parseFloat(val) || undefined,
-                      }))
-                    }
+                        temperature: Number.isNaN(parsed)
+                          ? undefined
+                          : parsed,
+                      }));
+                    }}
                     type="number"
                     step={0.1}
                     min={0}
@@ -1460,7 +1491,7 @@ export function FileConfigModal({
                         {t.currentGlobal}: {globalKvCache}
                       </span>
                     </div>
-                    <select
+                    <Select
                       value={
                         !config.useGlobalDefaults && config.kvCacheType
                           ? config.kvCacheType
@@ -1494,7 +1525,7 @@ export function FileConfigModal({
                       <option value="q8_0">{t.kvOptions.q8_0}</option>
                       <option value="q5_1">{t.kvOptions.q5_1}</option>
                       <option value="q4_0">{t.kvOptions.q4_0}</option>
-                    </select>
+                    </Select>
                   </div>
 
                   {/* Seed Input */}
@@ -1539,7 +1570,7 @@ export function FileConfigModal({
                       <span className="text-[10px] text-muted-foreground">
                         {t.currentGlobal}: {globalFlashAttn ? t.on : t.off}
                       </span>
-                      <select
+                      <Select
                         className={`
                       h-8 text-sm rounded-md border outline-none
                       ${
@@ -1574,7 +1605,7 @@ export function FileConfigModal({
                         </option>
                         <option value="true">{t.on}</option>
                         <option value="false">{t.off}</option>
-                      </select>
+                      </Select>
                     </div>
                   </div>
                 </div>
@@ -1709,35 +1740,17 @@ export function LibraryView({
   } | null>(null);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Queue state
-  const [queue, setQueue] = useState<QueueItem[]>(() => {
-    try {
-      const saved = localStorage.getItem(LIBRARY_QUEUE_KEY);
-      if (saved) return JSON.parse(saved);
-    } catch (e) {
-      console.error("[LibraryView] Load failed:", e);
-    }
-
-    // Migrate from legacy
-    try {
-      const legacy = localStorage.getItem(FILE_QUEUE_KEY);
-      if (legacy) {
-        const paths = JSON.parse(legacy) as string[];
-        return paths.map((path) => ({
-          id: generateId(),
-          path,
-          fileName: path.split(/[/\\]/).pop() || path,
-          fileType: getFileType(path),
-          addedAt: new Date().toISOString(),
-          config: { useGlobalDefaults: true },
-          status: "pending" as const,
-        }));
-      }
-    } catch (e) {
-      console.error("[LibraryView] Migration failed:", e);
-    }
-
-    return [];
-  });
+  const [queue, setQueue] = useState<QueueItem[]>(() =>
+    loadLibraryQueueWithLegacyMigration((path) => ({
+      id: generateId(),
+      path,
+      fileName: path.split(/[/\\]/).pop() || path,
+      fileType: getFileType(path),
+      addedAt: new Date().toISOString(),
+      config: { useGlobalDefaults: true },
+      status: "pending" as const,
+    })),
+  );
 
   const [isDragOver, setIsDragOver] = useState(false);
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
@@ -1911,7 +1924,13 @@ export function LibraryView({
   const filteredQueue = useMemo(() => {
     const keyword = searchQuery.trim().toLowerCase();
     return queue.filter((item) => {
-      if (statusFilter !== "all" && item.status !== statusFilter) return false;
+      if (statusFilter === "failed") {
+        if (item.status !== "failed" && item.status !== "interrupted") {
+          return false;
+        }
+      } else if (statusFilter !== "all" && item.status !== statusFilter) {
+        return false;
+      }
       if (!keyword) return true;
       return (
         item.fileName.toLowerCase().includes(keyword) ||
@@ -1980,15 +1999,7 @@ export function LibraryView({
 
   // Persist
   useEffect(() => {
-    try {
-      localStorage.setItem(LIBRARY_QUEUE_KEY, JSON.stringify(queue));
-      localStorage.setItem(
-        FILE_QUEUE_KEY,
-        JSON.stringify(queue.map((q) => q.path)),
-      );
-    } catch (e) {
-      console.error("[LibraryView] Save failed:", e);
-    }
+    persistLibraryQueue(queue);
   }, [queue]);
 
   useEffect(() => {
@@ -2001,9 +2012,56 @@ export function LibraryView({
 
   useEffect(() => {
     if (!window.api?.watchFolderAdd) return;
-    watchFolders.forEach((entry) => {
-      void window.api.watchFolderAdd(entry);
-    });
+    let cancelled = false;
+
+    const reconcileWatchFolders = async () => {
+      if (!window.api?.watchFolderList) return;
+      const listed = await window.api.watchFolderList();
+      const entries =
+        listed?.ok && Array.isArray(listed.entries) ? listed.entries : null;
+      if (cancelled || !entries) return;
+      setWatchFolders((prev) => {
+        const localById = new Map(
+          prev.map((entry) => [entry.id, normalizeWatchFolderConfig(entry)]),
+        );
+        const merged: WatchFolderConfig[] = [];
+        for (const remoteEntry of entries) {
+          const remoteConfig = normalizeWatchFolderConfig(remoteEntry.config);
+          const localConfig = localById.get(remoteConfig.id);
+          merged.push({
+            ...(localConfig || remoteConfig),
+            ...remoteConfig,
+            enabled: Boolean(remoteEntry.active),
+          });
+          localById.delete(remoteConfig.id);
+        }
+        for (const localConfig of localById.values()) {
+          merged.push(localConfig);
+        }
+        return merged;
+      });
+    };
+
+    const restoreWatchFolders = async () => {
+      const results = await Promise.all(
+        watchFolders.map((entry) => window.api!.watchFolderAdd(entry)),
+      );
+      if (cancelled) return;
+      const failedCount = results.filter((item) => !item?.ok).length;
+      if (failedCount > 0) {
+        pushWatchNotice({
+          type: "warning",
+          message: `${t.watchFolderUpdateFail} (${failedCount})`,
+        });
+      }
+      await reconcileWatchFolders();
+    };
+
+    void restoreWatchFolders();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const buildModelNamesForFilter = useCallback(() => {
@@ -2087,7 +2145,16 @@ export function LibraryView({
       }
 
       if (newItems.length > 0) {
-        setQueue((prev) => [...prev, ...newItems]);
+        setQueue((prev) => {
+          // Commit-time dedupe avoids duplicate enqueue under bursty concurrent events.
+          const existing = new Set(prev.map((q) => q.path));
+          const appendItems = newItems.filter((item) => {
+            if (existing.has(item.path)) return false;
+            existing.add(item.path);
+            return true;
+          });
+          return appendItems.length > 0 ? [...prev, ...appendItems] : prev;
+        });
       }
 
       const prefix = options?.source === "watch" ? watchNoticePrefix : "";
@@ -2587,17 +2654,7 @@ export function LibraryView({
 
       setIsDragOver(false);
 
-      const items = Array.from(e.dataTransfer.items);
-      const paths: string[] = [];
-
-      for (const item of items) {
-        if (item.kind === "file") {
-          const file = item.getAsFile();
-          if (file && (file as any).path) {
-            paths.push((file as any).path);
-          }
-        }
-      }
+      const paths = extractElectronDragPaths(e.dataTransfer);
 
       if (paths.length > 0) {
         const finalPaths: string[] = [];
@@ -3218,7 +3275,7 @@ export function LibraryView({
                     </button>
                   )}
                 </div>
-                <select
+                <Select
                   value={statusFilter}
                   onChange={(e) => setStatusFilter(e.target.value as any)}
                   className="h-7 text-xs rounded-md border border-border/40 bg-background/80 px-2 text-muted-foreground hover:text-foreground"
@@ -3227,7 +3284,7 @@ export function LibraryView({
                   <option value="pending">{t.filterPending}</option>
                   <option value="completed">{t.filterCompleted}</option>
                   <option value="failed">{t.filterFailed}</option>
-                </select>
+                </Select>
               </div>
             </div>
           )}
@@ -3276,7 +3333,7 @@ export function LibraryView({
                   </div>
 
                   <div className="flex flex-wrap justify-center gap-2 mt-2 px-12 relative z-10">
-                    {[".txt", ".epub", ".srt", ".ass"].map((ext) => (
+                    {[".txt", ".epub", ".srt", ".ass", ".ssa", ".xlsx"].map((ext) => (
                       <span
                         key={ext}
                         className="text-[10px] font-bold px-2 py-1 rounded-full bg-background border border-primary/10 text-muted-foreground/60 shadow-sm group-hover:border-primary/30 group-hover:text-primary/70 transition-all duration-500"

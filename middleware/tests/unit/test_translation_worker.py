@@ -9,7 +9,12 @@ if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
 import translation_worker as worker_module
-from translation_worker import TranslationTask, TranslationWorker, TaskStatus
+from translation_worker import (
+    TranslationTask,
+    TranslationWorker,
+    TaskStatus,
+    normalize_cuda_visible_devices,
+)
 
 
 class DummyStdout:
@@ -31,6 +36,31 @@ class DummyProcess:
 
     async def wait(self):
         await asyncio.sleep(0)
+        return self.returncode
+
+
+class BlockingStdout:
+    def __init__(self):
+        self.cancel_count = 0
+
+    async def readline(self):
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            self.cancel_count += 1
+            raise
+        return b""
+
+
+class BlockingProcess:
+    def __init__(self):
+        self.stdout = BlockingStdout()
+        self.returncode = None
+        self.pid = 24680
+
+    async def wait(self):
+        await asyncio.sleep(0)
+        self.returncode = -9
         return self.returncode
 
 
@@ -100,7 +130,7 @@ class DummyRequest:
         self.chunk_size = overrides.get("chunk_size", 1000)
         self.ctx = overrides.get("ctx", 2048)
         self.gpu_layers = overrides.get("gpu_layers", -1)
-        self.temperature = overrides.get("temperature", 0.7)
+        self.temperature = overrides.get("temperature", 0.3)
         self.line_format = overrides.get("line_format", "single")
         self.strict_mode = overrides.get("strict_mode", "off")
         self.line_check = overrides.get("line_check", False)
@@ -143,6 +173,117 @@ class DummyRequest:
         self.fix_kana = overrides.get("fix_kana", False)
         self.fix_punctuation = overrides.get("fix_punctuation", False)
         self.gpu_device_id = overrides.get("gpu_device_id")
+
+
+@pytest.mark.unit
+def test_dummy_request_defaults_temperature_to_point_three():
+    assert DummyRequest().temperature == 0.3
+
+
+@pytest.mark.unit
+def test_normalize_cuda_visible_devices_accepts_multi_gpu_indices():
+    assert normalize_cuda_visible_devices("0, 1,1") == "0,1"
+    assert normalize_cuda_visible_devices("0 2") == "0,2"
+    assert normalize_cuda_visible_devices("0；2") == "0,2"
+    assert normalize_cuda_visible_devices("-1") == "-1"
+
+
+@pytest.mark.unit
+def test_normalize_cuda_visible_devices_accepts_uuid_tokens():
+    assert (
+        normalize_cuda_visible_devices("GPU-aaaaaaaa-bbbb-cccc-dddd")
+        == "GPU-aaaaaaaa-bbbb-cccc-dddd"
+    )
+    assert (
+        normalize_cuda_visible_devices("MIG-GPU-aaaa/1/2")
+        == "MIG-GPU-aaaa/1/2"
+    )
+
+
+@pytest.mark.unit
+def test_normalize_cuda_visible_devices_rejects_invalid_tokens():
+    assert normalize_cuda_visible_devices("abc,@@@") is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_translate_preserves_structured_output_extension(monkeypatch, tmp_path):
+    worker = TranslationWorker(model_path="model.gguf")
+
+    worker.server_process = DummyServerProcess(returncode=None)
+    monkeypatch.setattr(worker, "is_ready", lambda: True)
+
+    captured = {}
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        output_index = captured["cmd"].index("--output") + 1
+        Path(captured["cmd"][output_index]).write_bytes(b"\xff\xfePK")
+        return DummyProcess([])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    uploads_dir = Path(__file__).resolve().parents[2] / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    input_path = uploads_dir / "book.epub"
+    input_path.write_bytes(b"PK")
+
+    task = TranslationTask(
+        task_id="epub1",
+        request=DummyRequest(text=None, file_path=str(input_path)),
+    )
+    outputs_dir = Path(__file__).resolve().parents[2] / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    output_path = outputs_dir / f"{task.task_id}_output.epub"
+
+    result = await worker.translate(task)
+
+    assert task.get_output_path() == str(output_path)
+    assert result == f"[Binary output: {output_path}]"
+    cmd = captured["cmd"]
+    assert "--output" in cmd
+    output_index = cmd.index("--output") + 1
+    assert cmd[output_index].endswith("_output.epub")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_translate_xlsx_keeps_output_suffix(monkeypatch):
+    worker = TranslationWorker(model_path="model.gguf")
+
+    monkeypatch.setattr(worker, "is_ready", lambda: True)
+
+    captured = {}
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        output_index = captured["cmd"].index("--output") + 1
+        Path(captured["cmd"][output_index]).write_bytes(b"\xff\xfePK")
+        return DummyProcess([])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    uploads_dir = Path(__file__).resolve().parents[2] / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    input_path = uploads_dir / "sheet.xlsx"
+    input_path.write_bytes(b"PK")
+
+    task = TranslationTask(
+        task_id="xlsx1",
+        request=DummyRequest(text=None, file_path=str(input_path)),
+    )
+    outputs_dir = Path(__file__).resolve().parents[2] / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    output_path = outputs_dir / f"{task.task_id}_output.xlsx"
+
+    result = await worker.translate(task)
+
+    assert task.get_output_path() == str(output_path)
+    assert result == f"[Binary output: {output_path}]"
+    cmd = captured["cmd"]
+    assert "--output" in cmd
+    output_index = cmd.index("--output") + 1
+    assert cmd[output_index].endswith("_output.xlsx")
 
 
 @pytest.mark.unit
@@ -229,6 +370,43 @@ async def test_translate_cancel_requested_kills_process(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_translate_cancel_requested_during_silent_output(monkeypatch):
+    worker = TranslationWorker(model_path="model.gguf")
+    monkeypatch.setattr(worker, "is_ready", lambda: True)
+
+    process = BlockingProcess()
+    killed = {"called": False}
+
+    async def fake_kill(target_process):
+        killed["called"] = True
+        assert target_process is process
+        process.returncode = -9
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        return process
+
+    monkeypatch.setattr(worker, "_kill_process_tree", fake_kill)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    task = TranslationTask(task_id="cancel_silent", request=DummyRequest())
+
+    async def trigger_cancel():
+        await asyncio.sleep(0.05)
+        task.cancel_requested = True
+
+    cancel_trigger = asyncio.create_task(trigger_cancel())
+    result = await asyncio.wait_for(worker.translate(task), timeout=2)
+    await cancel_trigger
+
+    assert result == ""
+    assert task.status == TaskStatus.CANCELLED
+    assert killed["called"] is True
+    assert process.stdout.cancel_count >= 1
+    assert any("cancelled" in line.lower() for line in task.logs)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_translate_rejects_unsafe_file_path(monkeypatch, tmp_path):
     worker = TranslationWorker(model_path="model.gguf")
     monkeypatch.setattr(worker, "is_ready", lambda: True)
@@ -281,6 +459,63 @@ async def test_translate_protect_patterns_outside_allowed(monkeypatch, tmp_path)
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_translate_sets_normalized_cuda_visible_devices(monkeypatch, tmp_path):
+    worker = TranslationWorker(model_path="model.gguf")
+    monkeypatch.setattr(worker, "is_ready", lambda: True)
+
+    captured = {}
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        captured["env"] = kwargs.get("env", {})
+        return DummyProcess([])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    task = TranslationTask(
+        task_id="gpu-id-valid",
+        request=DummyRequest(gpu_device_id="0, 1,1"),
+    )
+    outputs_dir = Path(__file__).resolve().parents[2] / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    output_path = outputs_dir / f"{task.task_id}_output.txt"
+    output_path.write_text("ok", encoding="utf-8")
+
+    result = await worker.translate(task)
+    assert result == "ok"
+    assert captured["env"].get("CUDA_VISIBLE_DEVICES") == "0,1"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_translate_ignores_invalid_gpu_device_id(monkeypatch, tmp_path):
+    worker = TranslationWorker(model_path="model.gguf")
+    monkeypatch.setattr(worker, "is_ready", lambda: True)
+
+    captured = {}
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        captured["env"] = kwargs.get("env", {})
+        return DummyProcess([])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    task = TranslationTask(
+        task_id="gpu-id-invalid",
+        request=DummyRequest(gpu_device_id="abc,@@"),
+    )
+    outputs_dir = Path(__file__).resolve().parents[2] / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    output_path = outputs_dir / f"{task.task_id}_output.txt"
+    output_path.write_text("ok", encoding="utf-8")
+
+    result = await worker.translate(task)
+    assert result == "ok"
+    assert "CUDA_VISIBLE_DEVICES" not in captured["env"]
+    assert any("Ignored invalid gpu_device_id" in line for line in task.logs)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_translate_disables_retry_prompt_feedback(monkeypatch, tmp_path):
     worker = TranslationWorker(model_path="model.gguf")
     worker._current_config = {
@@ -318,6 +553,47 @@ async def test_translate_disables_retry_prompt_feedback(monkeypatch, tmp_path):
     cmd = captured["cmd"]
     assert "--no-retry-prompt-feedback" in cmd
     assert "--retry-prompt-feedback" not in cmd
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_translate_does_not_pass_qc_kana_flags(monkeypatch, tmp_path):
+    worker = TranslationWorker(model_path="model.gguf")
+    worker._current_config = {
+        "model_path": "model.gguf",
+        "ctx": 2048,
+        "gpu_layers": -1,
+        "flash_attn": False,
+        "kv_cache_type": "f16",
+        "parallel": 1,
+        "use_large_batch": False,
+        "batch_size": None,
+        "seed": None,
+    }
+    monkeypatch.setattr(worker, "is_ready", lambda: True)
+
+    captured = {}
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return DummyProcess([])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    task = TranslationTask(
+        task_id="qc-kana-off",
+        request=DummyRequest(),
+    )
+    outputs_dir = Path(__file__).resolve().parents[2] / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    output_path = outputs_dir / f"{task.task_id}_output.txt"
+    output_path.write_text("ok", encoding="utf-8")
+
+    result = await worker.translate(task)
+    assert result == "ok"
+    cmd = captured["cmd"]
+    assert "--no-qc-kana" not in cmd
+    assert "--qc-kana" not in cmd
 
 
 @pytest.mark.unit
@@ -362,8 +638,103 @@ async def test_wait_for_server_ready_success(monkeypatch):
     class DummyResp:
         status_code = 200
 
+        @staticmethod
+        def json():
+            return {"object": "list", "data": []}
+
     monkeypatch.setattr(worker_module.requests, "get", lambda *args, **kwargs: DummyResp())
     await worker._wait_for_server_ready(timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_wait_for_server_ready_uses_to_thread(monkeypatch):
+    worker = TranslationWorker(model_path="model.gguf")
+    worker.server_process = DummyServerProcess(returncode=None)
+
+    called = {}
+
+    async def fake_to_thread(func, *args, **kwargs):
+        called["func"] = func
+        called["args"] = args
+        called["kwargs"] = kwargs
+
+        class DummyResp:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"object": "list", "data": []}
+
+        return DummyResp()
+
+    monkeypatch.setattr(worker_module.asyncio, "to_thread", fake_to_thread)
+    await worker._wait_for_server_ready(timeout=1)
+
+    assert called["func"] is worker_module.requests.get
+    assert called["args"][0].endswith("/v1/models")
+    assert called["kwargs"]["timeout"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_wait_for_server_ready_rejects_non_json_200(monkeypatch):
+    worker = TranslationWorker(model_path="model.gguf")
+    worker.server_process = DummyServerProcess(returncode=None)
+
+    class HtmlResp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            raise ValueError("html body")
+
+    monkeypatch.setattr(worker_module.requests, "get", lambda *args, **kwargs: HtmlResp())
+
+    async def fake_sleep(_seconds):
+        return None
+
+    clock = {"t": 0.0}
+
+    def fake_time():
+        clock["t"] += 0.3
+        return clock["t"]
+
+    monkeypatch.setattr(worker_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(worker_module.time, "time", fake_time)
+
+    with pytest.raises(TimeoutError):
+        await worker._wait_for_server_ready(timeout=0.5)
+
+
+@pytest.mark.unit
+def test_translation_task_snapshot_status_and_realtime():
+    task = TranslationTask(task_id="snap", request=object())
+    task.set_status(TaskStatus.RUNNING)
+    task.set_progress(0.25, 1, 4)
+    task.set_result("ok")
+    task.set_error("warn")
+    for idx in range(80):
+        task.add_log(f"log-{idx}")
+
+    default_snapshot = task.snapshot_status(log_from=None, log_limit=20)
+    assert len(default_snapshot["logs"]) == 50
+    assert default_snapshot["logs"][0] == "log-30"
+    assert default_snapshot["next_log_index"] == 80
+    assert default_snapshot["log_total"] == 80
+    assert default_snapshot["logs_truncated"] is True
+    assert default_snapshot["status"] == TaskStatus.RUNNING
+    assert default_snapshot["progress"] == 0.25
+
+    ranged_snapshot = task.snapshot_status(log_from=70, log_limit=5)
+    assert ranged_snapshot["logs"] == ["log-70", "log-71", "log-72", "log-73", "log-74"]
+    assert ranged_snapshot["next_log_index"] == 75
+
+    realtime_snapshot = task.snapshot_realtime(log_from=78)
+    assert realtime_snapshot["logs"] == ["log-78", "log-79"]
+    assert realtime_snapshot["next_log_index"] == 80
+    assert realtime_snapshot["result"] == "ok"
+    assert realtime_snapshot["error"] == "warn"
 
 
 @pytest.mark.unit

@@ -66,6 +66,12 @@ from murasaki_translator.core.engine import InferenceEngine
 from murasaki_translator.core.parser import ResponseParser
 from murasaki_translator.core.quality_checker import QualityChecker, format_warnings_for_log, calculate_glossary_coverage
 from murasaki_translator.core.text_protector import TextProtector  # [Experimental] 占位符保护
+from murasaki_translator.core.anchor_guard import (
+    normalize_anchor_stream as _shared_normalize_anchor_stream,
+    prepare_local_anchor_context,
+    restore_output_anchors,
+    repair_and_validate_anchor_output,
+)
 from murasaki_translator.core.cache import TranslationCache  # 翻译缓存用于校对
 from rule_processor import RuleProcessor
 from murasaki_translator.utils.monitor import HardwareMonitor
@@ -73,6 +79,33 @@ from murasaki_translator.utils.line_aligner import LineAligner
 from murasaki_translator.fixer import NumberFixer, Normalizer, PunctuationFixer, KanaFixer, RubyCleaner
 from murasaki_translator.documents import DocumentFactory
 from murasaki_translator.utils.alignment_handler import AlignmentHandler
+
+V1_KANA_RETRY_THRESHOLD = 0.30
+_KANA_CHAR_RE = re.compile(r"[\u3040-\u30FF\u31F0-\u31FF]")
+_NON_SPACE_RE = re.compile(r"\S")
+
+
+def _calculate_kana_ratio(text: str) -> tuple:
+    normalized = str(text or "")
+    effective_chars = len(_NON_SPACE_RE.findall(normalized))
+    if effective_chars <= 0:
+        return 0.0, 0, 0
+    kana_chars = len(_KANA_CHAR_RE.findall(normalized))
+    return kana_chars / effective_chars, kana_chars, effective_chars
+
+
+def _extract_interrupted_preview_text(data: Dict) -> str:
+    """
+    兼容中断重建的历史字段，优先读取当前主字段 out_text。
+    """
+    if not isinstance(data, dict):
+        return ""
+    for key in ("out_text", "preview_text", "output"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
 
 def load_glossary(path: Optional[str]) -> Dict[str, str]:
     """
@@ -249,17 +282,6 @@ def _collect_protect_rule_lines(rules: List[Dict]) -> tuple:
     return enabled, lines
 
 
-def _collect_legacy_protect_lines(post_rules: List[Dict]) -> List[str]:
-    lines: List[str] = []
-    for rule in post_rules or []:
-        if not rule or not rule.get("active", True):
-            continue
-        if rule.get("pattern") == "restore_protection":
-            options = rule.get("options") if isinstance(rule.get("options"), dict) else {}
-            raw = options.get("customPattern")
-            lines.extend(_parse_protect_pattern_payload(raw))
-    return lines
-
 
 def _merge_protect_patterns(base: Optional[List[str]], additions: List[str], removals: List[str]) -> List[str]:
     merged = list(base) if base else []
@@ -271,44 +293,60 @@ def _merge_protect_patterns(base: Optional[List[str]], additions: List[str], rem
     return merged
 
 
-def _allow_text_protect(input_path: Optional[str], args) -> bool:
-    if getattr(args, "single_block", None) and not input_path:
-        return True
-    if getattr(args, "alignment_mode", False):
-        if not input_path:
-            return True
-        return os.path.splitext(input_path)[1].lower() == ".txt"
+_STRUCTURED_TEXT_PROTECT_EXTS = (".epub", ".srt", ".ass", ".ssa")
+
+
+def _is_structured_text_protect_input(input_path: Optional[str]) -> bool:
     if not input_path:
         return False
     ext = os.path.splitext(input_path)[1].lower()
-    return ext == ".txt"
+    return ext in _STRUCTURED_TEXT_PROTECT_EXTS
+
+
+def _normalize_alignment_mode_for_input(input_path: Optional[str], args) -> bool:
+    if not getattr(args, "alignment_mode", False):
+        return False
+    if not input_path:
+        return True
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == ".txt":
+        return True
+    print(f"[Alignment] Ignoring alignment mode for non-txt input: {ext or '<unknown>'}")
+    args.alignment_mode = False
+    return False
+
+
+def _is_xlsx_input(input_path: Optional[str]) -> bool:
+    if not input_path:
+        return False
+    return os.path.splitext(input_path)[1].lower() == ".xlsx"
+
+
+def _uses_alignment_reconstruction(input_path: Optional[str], args) -> bool:
+    return _is_xlsx_input(input_path) or bool(getattr(args, "alignment_mode", False))
+
+
+def _get_v1_anchor_mode(input_path: Optional[str], args) -> str:
+    ext = os.path.splitext(input_path or "")[1].lower()
+    if _uses_alignment_reconstruction(input_path, args):
+        return "alignment"
+    if ext == ".epub":
+        return "epub"
+    return ""
+
+
+def _allow_text_protect(input_path: Optional[str], args) -> bool:
+    if getattr(args, "single_block", None) and not input_path:
+        return True
+    if not input_path:
+        return False
+    ext = os.path.splitext(input_path)[1].lower()
+    return ext in {".txt", ".xlsx"} or ext in _STRUCTURED_TEXT_PROTECT_EXTS
 
 
 def _normalize_anchor_stream(text: str) -> str:
-    """Normalize potentially mangled @id/@end anchors (full-width, spaces, newlines)."""
-    if not text:
-        return text
-
-    def _normalize_digits(s: str) -> str:
-        return s.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
-
-    def _fix_id(m: re.Match) -> str:
-        return f"@id={_normalize_digits(m.group(1))}@"
-
-    def _fix_end(m: re.Match) -> str:
-        return f"@end={_normalize_digits(m.group(1))}@"
-
-    text = re.sub(
-        r"[@＠]\s*[iｉIＩ]\s*[dｄDＤ]\s*[=＝]\s*([0-9０-９]+)\s*[@＠]",
-        _fix_id,
-        text,
-    )
-    text = re.sub(
-        r"[@＠]\s*[eｅEＥ]\s*[nｎNＮ]\s*[dｄDＤ]\s*[=＝]\s*([0-9０-９]+)\s*[@＠]",
-        _fix_end,
-        text,
-    )
-    return text
+    """Normalize potentially mangled @id/@end anchors."""
+    return _shared_normalize_anchor_stream(text)
 
 
 def _detect_anchor_missing(original_src_text: str, output_text: str, args) -> tuple:
@@ -322,18 +360,19 @@ def _detect_anchor_missing(original_src_text: str, output_text: str, args) -> tu
     file_path = getattr(args, "file", "") or ""
     ext = os.path.splitext(file_path)[1].lower()
 
-    # Alignment mode: @id=ID@ ... @id=ID@ (same marker twice)
+    # Alignment mode: require paired @id=ID@ ... @end=ID@
     if getattr(args, "alignment_mode", False):
         src_norm = _normalize_anchor_stream(original_src_text)
         out_norm = _normalize_anchor_stream(output_text)
         src_ids = re.findall(r"@id=(\d+)@", src_norm)
         if not src_ids:
             return False, {}
-        out_ids = re.findall(r"@id=(\d+)@", out_norm)
-        counts = {}
-        for uid in out_ids:
-            counts[uid] = counts.get(uid, 0) + 1
-        missing = [uid for uid in set(src_ids) if counts.get(uid, 0) < 2]
+        out_id_set = set(re.findall(r"@id=(\d+)@", out_norm))
+        out_end_set = set(re.findall(r"@end=(\d+)@", out_norm))
+        missing = [
+            uid for uid in set(src_ids)
+            if uid not in out_id_set or uid not in out_end_set
+        ]
         if missing:
             return True, {"format": "alignment", "missing_count": len(missing)}
         return False, {}
@@ -388,9 +427,30 @@ def translate_block_with_retry(
     Unified A/B/C/D retry strategy for a single block.
     Used by both batch translation and single-block re-translation.
     """
+    raw_original_src_text = original_src_text
+    working_original_src_text = original_src_text
+    working_processed_src_text = processed_src_text
+    anchor_local_ctx = None
+
+    file_path = getattr(args, "file", "") or ""
+    file_ext = os.path.splitext(file_path)[1].lower()
+    anchor_mode = _get_v1_anchor_mode(file_path, args)
+    structured_alignment_mode = anchor_mode == "alignment" and file_ext in {".txt", ".xlsx"}
+    if anchor_mode in {"alignment", "epub"}:
+        candidate_ctx = prepare_local_anchor_context(
+            working_original_src_text,
+            working_processed_src_text,
+            mode=anchor_mode,
+        )
+        if candidate_ctx.enabled:
+            anchor_local_ctx = candidate_ctx
+            working_original_src_text = candidate_ctx.source_text_local
+            working_processed_src_text = candidate_ctx.prompt_text_local
+    should_restore_localized_anchors = bool(anchor_local_ctx and anchor_local_ctx.enabled)
+
     # Build Initial Prompt
     messages = prompt_builder.build_messages(
-        processed_src_text, 
+        working_processed_src_text,
         enable_cot=args.debug,
         preset=args.preset
     )
@@ -403,28 +463,37 @@ def translate_block_with_retry(
     best_result = None
     retry_history = []  # Track all retry attempts for debugging
     anchor_attempts = 0
-    structural_retry_happened = False
+    kana_retry_attempts = 0
+    kana_retry_budget = 1
     anchor_retry_budget = 0
-    if getattr(args, "anchor_check", False):
+    if getattr(args, "anchor_check", False) or structured_alignment_mode:
         try:
-            anchor_retry_budget = max(0, int(getattr(args, "anchor_check_retries", 0)))
+            if structured_alignment_mode:
+                anchor_retry_budget = max(0, int(getattr(args, "max_retries", 0)))
+            else:
+                anchor_retry_budget = max(0, int(getattr(args, "anchor_check_retries", 0)))
         except Exception:
             anchor_retry_budget = 0
     
     final_output = None
 
-    total_retry_budget = max(0, args.max_retries, args.coverage_retries, anchor_retry_budget)
-
     while True:
-        attempt = global_attempts + glossary_attempts + anchor_attempts
-        if attempt > total_retry_budget:
-            break
+        # 每轮重置结构性重试标记，避免前一轮状态污染后续重试链路。
+        structural_retry_happened = False
+        # 采用“分预算”策略：行数/术语/锚点/假名各自控制重试次数，互不抢占。
+        # 这里仅用于反馈注入与调温，不作为总预算拦截条件。
+        attempt = (
+            global_attempts
+            + glossary_attempts
+            + anchor_attempts
+            + kana_retry_attempts
+        )
 
         current_temp = args.temperature
         current_rep_base = args.rep_penalty_base
         
-        if retry_reason in ('line_check', 'strict_line_check', 'anchor_missing'):
-            retry_steps = max(1, global_attempts + anchor_attempts)
+        if retry_reason in ('line_check', 'strict_line_check', 'anchor_missing', 'kana_residue'):
+            retry_steps = max(1, global_attempts + anchor_attempts + kana_retry_attempts)
             current_temp = min(args.temperature + (retry_steps * args.retry_temp_boost), 1.2)
         elif retry_reason == 'glossary':
             current_temp = max(args.temperature - (glossary_attempts * args.retry_temp_boost), 0.3)
@@ -478,70 +547,155 @@ def translate_block_with_retry(
                 continue
             else: break
 
-        src_line_count = len([l for l in original_src_text.splitlines() if l.strip()])
-        dst_line_count = len([l for l in parsed_lines if l.strip()])
-        diff = abs(dst_line_count - src_line_count)
-        pct_diff = diff / max(1, src_line_count)
-        
-        is_invalid_lines = False
-        error_type = 'line_check'
-        if strict_mode and diff > 0:
-            is_invalid_lines = True
-            error_type = 'strict_line_check'
-        elif args.line_check and (diff > args.line_tolerance_abs or pct_diff > args.line_tolerance_pct):
-            is_invalid_lines = True
-            error_type = 'line_check'
-
-        if is_invalid_lines:
-            if global_attempts < args.max_retries:
-                global_attempts += 1
-                retry_reason = error_type
-                structural_retry_happened = True
-                retry_history.append({'attempt': global_attempts, 'type': error_type, 'src_lines': src_line_count, 'dst_lines': dst_line_count, 'raw_output': raw_output or ''})
-                safe_print_json("JSON_RETRY", {'block': block_idx + 1, 'attempt': global_attempts, 'type': error_type, 'src_lines': src_line_count, 'dst_lines': dst_line_count, 'temp': round(current_temp, 2)})
-                continue
-            else:
-                # No retry budget left: keep current output and skip lower-priority retries
-                structural_retry_happened = True
-        
-        # Core Anchor Check (EPUB / Subtitle / Alignment)
         anchor_check_text = "\n".join(parsed_lines)
         if protector:
             try:
                 anchor_check_text = protector.restore(anchor_check_text)
             except Exception:
                 pass
-        anchor_missing, anchor_meta = _detect_anchor_missing(
-            original_src_text,
-            anchor_check_text,
-            args
-        )
-        if anchor_missing:
-            if anchor_attempts < anchor_retry_budget:
-                anchor_attempts += 1
-                retry_reason = 'anchor_missing'
+
+        if structured_alignment_mode:
+            repaired_text, repaired_ok, anchor_meta = repair_and_validate_anchor_output(
+                working_original_src_text,
+                anchor_check_text,
+                mode="alignment",
+            )
+            anchor_missing = not repaired_ok
+            if repaired_ok:
+                anchor_check_text = repaired_text
+                parsed_lines = anchor_check_text.split("\n")
+
+            if anchor_missing:
+                if global_attempts < args.max_retries:
+                    global_attempts += 1
+                    retry_reason = 'anchor_missing'
+                    structural_retry_happened = True
+                    retry_payload = {
+                        'block': block_idx + 1,
+                        'attempt': global_attempts,
+                        'type': 'anchor_missing',
+                        'temp': round(current_temp, 2),
+                    }
+                    retry_payload.update(anchor_meta or {})
+                    retry_history.append({**retry_payload, 'raw_output': raw_output or ''})
+                    safe_print_json("JSON_RETRY", retry_payload)
+                    continue
                 structural_retry_happened = True
-                retry_payload = {
-                    'block': block_idx + 1,
-                    'attempt': anchor_attempts,
-                    'type': 'anchor_missing',
-                    'temp': round(current_temp, 2),
-                }
-                retry_payload.update(anchor_meta or {})
-                retry_history.append({**retry_payload, 'raw_output': raw_output or ''})
-                safe_print_json("JSON_RETRY", retry_payload)
-                continue
-            # No retry budget left: keep current output and skip lower-priority retries
-            structural_retry_happened = True
+
+            if not anchor_missing:
+                src_line_count = len([l for l in working_original_src_text.splitlines() if l.strip()])
+                dst_line_count = len([l for l in parsed_lines if l.strip()])
+                diff = abs(dst_line_count - src_line_count)
+                if diff > 0:
+                    if global_attempts < args.max_retries:
+                        global_attempts += 1
+                        retry_reason = 'strict_line_check'
+                        structural_retry_happened = True
+                        retry_payload = {
+                            'block': block_idx + 1,
+                            'attempt': global_attempts,
+                            'type': 'strict_line_check',
+                            'src_lines': src_line_count,
+                            'dst_lines': dst_line_count,
+                            'temp': round(current_temp, 2),
+                        }
+                        retry_history.append({**retry_payload, 'raw_output': raw_output or ''})
+                        safe_print_json("JSON_RETRY", retry_payload)
+                        continue
+                    structural_retry_happened = True
+        else:
+            src_line_count = len([l for l in working_original_src_text.splitlines() if l.strip()])
+            dst_line_count = len([l for l in parsed_lines if l.strip()])
+            diff = abs(dst_line_count - src_line_count)
+            pct_diff = diff / max(1, src_line_count)
+            
+            is_invalid_lines = False
+            error_type = 'line_check'
+            if strict_mode and diff > 0:
+                is_invalid_lines = True
+                error_type = 'strict_line_check'
+            elif args.line_check and (diff > args.line_tolerance_abs or pct_diff > args.line_tolerance_pct):
+                is_invalid_lines = True
+                error_type = 'line_check'
+
+            if is_invalid_lines:
+                if global_attempts < args.max_retries:
+                    global_attempts += 1
+                    retry_reason = error_type
+                    structural_retry_happened = True
+                    retry_history.append({'attempt': global_attempts, 'type': error_type, 'src_lines': src_line_count, 'dst_lines': dst_line_count, 'raw_output': raw_output or ''})
+                    safe_print_json("JSON_RETRY", {'block': block_idx + 1, 'attempt': global_attempts, 'type': error_type, 'src_lines': src_line_count, 'dst_lines': dst_line_count, 'temp': round(current_temp, 2)})
+                    continue
+                else:
+                    # No retry budget left: keep current output and skip lower-priority retries
+                    structural_retry_happened = True
+            
+            # Core Anchor Check (EPUB / Subtitle / Alignment)
+            if anchor_mode in {"alignment", "epub"}:
+                repaired_text, repaired_ok, anchor_meta = repair_and_validate_anchor_output(
+                    working_original_src_text,
+                    anchor_check_text,
+                    mode=anchor_mode,
+                )
+                anchor_missing = not repaired_ok
+                if repaired_ok:
+                    anchor_check_text = repaired_text
+                    parsed_lines = anchor_check_text.split("\n")
+            else:
+                anchor_missing, anchor_meta = _detect_anchor_missing(
+                    raw_original_src_text,
+                    anchor_check_text,
+                    args
+                )
+            if anchor_missing:
+                if anchor_attempts < anchor_retry_budget:
+                    anchor_attempts += 1
+                    retry_reason = 'anchor_missing'
+                    structural_retry_happened = True
+                    retry_payload = {
+                        'block': block_idx + 1,
+                        'attempt': anchor_attempts,
+                        'type': 'anchor_missing',
+                        'temp': round(current_temp, 2),
+                    }
+                    retry_payload.update(anchor_meta or {})
+                    retry_history.append({**retry_payload, 'raw_output': raw_output or ''})
+                    safe_print_json("JSON_RETRY", retry_payload)
+                    continue
+                # No retry budget left: keep current output and skip lower-priority retries
+                structural_retry_happened = True
+
+        if not structural_retry_happened:
+            translated_text_for_kana = '\n'.join(parsed_lines)
+            kana_ratio, kana_chars, effective_chars = _calculate_kana_ratio(
+                translated_text_for_kana
+            )
+            if effective_chars > 0 and kana_ratio >= V1_KANA_RETRY_THRESHOLD:
+                if kana_retry_attempts < kana_retry_budget:
+                    kana_retry_attempts += 1
+                    retry_reason = 'kana_residue'
+                    retry_payload = {
+                        'block': block_idx + 1,
+                        'attempt': kana_retry_attempts,
+                        'type': 'kana_residue',
+                        'ratio': round(kana_ratio, 6),
+                        'threshold': V1_KANA_RETRY_THRESHOLD,
+                        'kana_chars': kana_chars,
+                        'effective_chars': effective_chars,
+                        'temp': round(current_temp, 2),
+                    }
+                    retry_history.append({**retry_payload, 'raw_output': raw_output or ''})
+                    safe_print_json("JSON_RETRY", retry_payload)
+                    continue
 
         if glossary and args.output_hit_threshold > 0 and not structural_retry_happened:
             translated_text = '\n'.join(parsed_lines)
             passed, coverage, cot_coverage, hit, total = calculate_glossary_coverage(
-                original_src_text, translated_text, glossary, cot_content,
+                raw_original_src_text, translated_text, glossary, cot_content,
                 args.output_hit_threshold, args.cot_coverage_threshold
             )
             last_coverage = coverage
-            last_missed_terms = get_missed_terms(original_src_text, translated_text, glossary)
+            last_missed_terms = get_missed_terms(raw_original_src_text, translated_text, glossary)
             
             if best_result is None or coverage > best_result[3]:
                 best_result = (parsed_lines.copy(), cot_content, raw_output, coverage, block_usage)
@@ -572,20 +726,32 @@ def translate_block_with_retry(
         if best_result:
             parsed_lines, cot_content, raw_output, _, block_usage = best_result
         else:
-            parsed_lines = ["[翻译失败]"] + original_src_text.split('\n')
+            parsed_lines = ["[翻译失败]"] + raw_original_src_text.split('\n')
             cot_content, raw_output, block_usage = "", "", {}
+            should_restore_localized_anchors = False
         final_output = {"parsed_lines": parsed_lines, "cot": cot_content, "raw": raw_output, "usage": block_usage}
 
     base_text = '\n'.join(final_output["parsed_lines"])
-    processed_text = post_processor.process(base_text, src_text=original_src_text, protector=protector, strict_line_count=strict_mode)
+    processed_text = post_processor.process(
+        base_text,
+        src_text=raw_original_src_text,
+        protector=protector,
+        strict_line_count=strict_mode,
+    )
+    if should_restore_localized_anchors:
+        processed_text = restore_output_anchors(
+            processed_text,
+            anchor_local_ctx.local_to_global,
+        )
     
     warnings = []
     try:
         qc = QualityChecker(glossary=glossary)
+        qc_source_lang = "ja"
         warnings = qc.check_output(
-            [l for l in original_src_text.split('\n') if l.strip()], 
+            [l for l in raw_original_src_text.split('\n') if l.strip()],
             [l for l in processed_text.split('\n') if l.strip()], 
-            source_lang="ja"
+            source_lang=qc_source_lang
         )
     except Exception as e:
         logger.debug(f"[QualityChecker] Check failed: {e}")
@@ -593,14 +759,14 @@ def translate_block_with_retry(
     return {
         "success": True,
         "block_idx": block_idx,
-        "src_text": original_src_text,
+        "src_text": raw_original_src_text,
         "out_text": processed_text,
         "preview_text": processed_text,
         "cot": final_output["cot"],
         "raw_output": final_output["raw"],
         "warnings": warnings,
         "lines_count": len([l for l in processed_text.splitlines() if l.strip()]),
-        "chars_count": len(original_src_text),
+        "chars_count": len(raw_original_src_text),
         "cot_chars": len(final_output["cot"]),
         "usage": final_output["usage"],
         "protector_stats": protector.get_stats() if protector else None,
@@ -784,25 +950,30 @@ def translate_single_block(args):
     post_rules = load_rules(args.rules_post) if hasattr(args, 'rules_post') and args.rules_post else []
 
     protect_rule_enabled, protect_rule_lines = _collect_protect_rule_lines(pre_rules)
-    legacy_protect_lines = _collect_legacy_protect_lines(post_rules)
     input_path = getattr(args, 'file', '') or ""
+    _normalize_alignment_mode_for_input(input_path, args)
     text_protect_allowed = _allow_text_protect(input_path, args)
+    is_structured_protect_input = _is_structured_text_protect_input(input_path)
+    allow_user_protect_customization = text_protect_allowed and not is_structured_protect_input
+
     if text_protect_allowed:
-        if protect_rule_enabled and not args.text_protect:
+        if allow_user_protect_customization and protect_rule_enabled and not args.text_protect:
             print("[Auto-Config] Pre-rules text protection enabled.")
             args.text_protect = True
-        if legacy_protect_lines and not args.text_protect:
-            print("[Auto-Config] Legacy protection rule detected. Enabling TextProtector.")
-            args.text_protect = True
-        if args.protect_patterns and not args.text_protect:
+        if allow_user_protect_customization and args.protect_patterns and not args.text_protect:
             print("[Auto-Config] protect_patterns provided. Enabling TextProtector.")
             args.text_protect = True
+        if is_structured_protect_input and (protect_rule_enabled or args.protect_patterns):
+            print("[TextProtect] Structured input detected. Ignoring user custom protect rules; built-in patterns only.")
     else:
-        if args.text_protect or protect_rule_enabled or legacy_protect_lines or args.protect_patterns:
-            print("[TextProtect] Disabled for non-txt input.")
+        if args.text_protect or protect_rule_enabled or args.protect_patterns:
+            print("[TextProtect] Disabled for unsupported input type.")
         args.text_protect = False
+
+    if not allow_user_protect_customization:
         protect_rule_lines = []
-        legacy_protect_lines = []
+        if is_structured_protect_input:
+            args.protect_patterns = None
 
     post_rules = [r for r in post_rules if r.get('pattern') != 'restore_protection']
     if text_protect_allowed and args.text_protect:
@@ -814,7 +985,7 @@ def translate_single_block(args):
             custom_protector_patterns = TextProtector.SUBTITLE_PATTERNS
         elif getattr(args, 'file', '').lower().endswith('.epub'):
             custom_protector_patterns = [r'@id=\d+@', r'@end=\d+@', r'<[^>]+>']
-        elif args.alignment_mode:
+        elif _uses_alignment_reconstruction(getattr(args, 'file', ''), args):
             anchor_patterns = [r'@id=\d+@', r'@end=\d+@']
             custom_protector_patterns = _merge_protect_patterns(
                 TextProtector.DEFAULT_PATTERNS,
@@ -824,15 +995,11 @@ def translate_single_block(args):
 
         additions: List[str] = []
         removals: List[str] = []
-        if protect_rule_lines:
+        if allow_user_protect_customization and protect_rule_lines:
             add, rem = _parse_protect_pattern_lines(protect_rule_lines)
             additions.extend(add)
             removals.extend(rem)
-        if legacy_protect_lines:
-            add, rem = _parse_protect_pattern_lines(legacy_protect_lines)
-            additions.extend(add)
-            removals.extend(rem)
-        if args.protect_patterns and os.path.exists(args.protect_patterns):
+        if allow_user_protect_customization and args.protect_patterns and os.path.exists(args.protect_patterns):
             try:
                 raw_text = ""
                 with open(args.protect_patterns, 'r', encoding='utf-8') as f:
@@ -1090,7 +1257,7 @@ def main():
     parser.add_argument("--fix-punctuation", action="store_true", help="[Experimental] Normalize punctuation in output")
     
     # Quality Control Settings (高级质量控制)
-    parser.add_argument("--temperature", type=float, default=0.7, help="Model temperature (0.1-1.5, default 0.7)")
+    parser.add_argument("--temperature", type=float, default=0.3, help="Model temperature (0.1-1.5, default 0.3)")
     parser.add_argument("--line-check", action="store_true", help="Enable line count validation and auto-retry")
     parser.add_argument("--line-tolerance-abs", type=int, default=10, help="Line count absolute tolerance (default 10)")
     parser.add_argument("--line-tolerance-pct", type=float, default=0.2, help="Line count percent tolerance (default 0.2 = 20%%)")
@@ -1216,6 +1383,12 @@ def main():
             # Use DocumentFactory
             if source_path and os.path.exists(source_path):
                 doc = DocumentFactory.get_document(source_path)
+                if hasattr(doc, "set_runtime_context"):
+                    doc.set_runtime_context(
+                        engine_mode="v1",
+                        chunk_type="block",
+                        document_role="input",
+                    )
                 doc.load()
                 print(f"[Rebuild] Loaded document structure from: {source_path}")
                 doc.save(output_path, blocks)
@@ -1245,6 +1418,7 @@ def main():
     if not os.path.exists(input_path):
         print(f"Error: File not found {input_path}")
         return
+    _normalize_alignment_mode_for_input(input_path, args)
 
     # Resolve glossary path before loading
     glossary_path = args.glossary
@@ -1274,10 +1448,11 @@ def main():
 
     # Determine Output Paths
     _, file_ext = os.path.splitext(input_path)
+    alignment_reconstruction = _uses_alignment_reconstruction(input_path, args)
     # Determine Architecture (Novel vs Structured vs Alignment)
-    # is_structured: True for subtitle formats and alignment mode (which uses pseudo-SRT tags)
+    # is_structured: True for subtitle formats and alignment-style structured reconstruction.
     # 注意：普通 .txt 文件无论使用何种模式都不需要额外的 .txt 后缀
-    is_structured = file_ext.lower() in ['.epub', '.srt', '.ass', '.ssa'] or args.alignment_mode
+    is_structured = file_ext.lower() in ['.epub', '.srt', '.ass', '.ssa', '.xlsx'] or alignment_reconstruction
     # is_structured_doc: 决定是否需要写入临时 .txt 文件（仅对二进制/结构化格式需要）
     is_structured_doc = is_structured  # 只有真正的结构化文档才需要临时 txt
 
@@ -1380,9 +1555,9 @@ def main():
     #   - For short manga lines (~10 chars content), anchors add ~40% token overhead
     #   - Model must reproduce anchors in output, doubling effective overhead
     # Use 40% reduction (0.6x) to compensate, similar to ASS handling
-    if args.alignment_mode:
+    if alignment_reconstruction:
         effective_chunk_size = int(args.chunk_size * 0.6)
-        print(f"[Auto-Config] Alignment mode: chunk_size {args.chunk_size} -> {effective_chunk_size} (anchor overhead compensation)")
+        print(f"[Auto-Config] Alignment-style mode: chunk_size {args.chunk_size} -> {effective_chunk_size} (anchor overhead compensation)")
     
     # 2. ASS/SSA: Pseudo-SRT format with timestamps, indices
     # ~60-70% structural overhead, use 50% reduction
@@ -1427,37 +1602,39 @@ def main():
 
     add_unique_rule(post_rules, "number_fixer")
     protect_rule_enabled, protect_rule_lines = _collect_protect_rule_lines(pre_rules)
-    legacy_protect_lines = _collect_legacy_protect_lines(post_rules)
     text_protect_allowed = _allow_text_protect(input_path, args)
+    is_structured_protect_input = _is_structured_text_protect_input(input_path)
+    allow_user_protect_customization = text_protect_allowed and not is_structured_protect_input
     if text_protect_allowed:
-        if protect_rule_enabled and not args.text_protect:
+        if allow_user_protect_customization and protect_rule_enabled and not args.text_protect:
             print("[Auto-Config] Pre-rules text protection enabled.")
             args.text_protect = True
-        if legacy_protect_lines and not args.text_protect:
-            print("[Auto-Config] Legacy protection rule detected. Enabling TextProtector.")
+        if allow_user_protect_customization and args.protect_patterns and not args.text_protect:
+            print("[Auto-Config] protect_patterns provided. Enabling TextProtector.")
             args.text_protect = True
+        if is_structured_protect_input and (protect_rule_enabled or args.protect_patterns):
+            print("[TextProtect] Structured input detected. Ignoring user custom protect rules; built-in patterns only.")
     else:
-        if args.text_protect or protect_rule_enabled or legacy_protect_lines or args.protect_patterns:
-            print("[TextProtect] Disabled for non-txt input.")
+        if args.text_protect or protect_rule_enabled or args.protect_patterns:
+            print("[TextProtect] Disabled for unsupported input type.")
         args.text_protect = False
+
+    if not allow_user_protect_customization:
         protect_rule_lines = []
-        legacy_protect_lines = []
+        if is_structured_protect_input:
+            args.protect_patterns = None
 
     # [Formula Factory] Structured engineering
     if is_structured:
         # 规则熔断：针对字幕格式和对齐模式，剔除所有可能破坏换行或合并行数的规则
         # Alignment Mode 必须享受同等的规则熔断待遇，否则 PostProcess 会破坏 @id@ 结构
-        is_sub = input_path.lower().endswith(('.srt', '.ass', '.ssa')) or args.alignment_mode
+        is_sub = input_path.lower().endswith(('.srt', '.ass', '.ssa', '.xlsx')) or alignment_reconstruction
         if is_sub:
             melt_patterns = ['ensure_single_newline', 'ensure_double_newline', 'clean_empty_lines', 'merge_short_lines']
             original_count = len(post_rules)
             post_rules = [r for r in post_rules if r.get('pattern') not in melt_patterns]
             if len(post_rules) < original_count:
                 print(f"[Auto-Config] Subtitle/Alignment detected. Disabled {original_count - len(post_rules)} formatting rules to preserve structure.")
-
-    if text_protect_allowed and args.protect_patterns and not args.text_protect:
-        print("[Auto-Config] protect_patterns provided. Enabling TextProtector.")
-        args.text_protect = True
 
     # [Critical Fix] 强制将样式还原逻辑置于所有后处理规则的最末端，确保还原后不会再次被误伤
     # 先移除已有的（如果有），再追加到最后
@@ -1476,7 +1653,7 @@ def main():
             # [Specialized Rule] 针对 EPUB，保护 @id=ID@/@end=ID@ 锚点和可能残留的 HTML 标签
             custom_protector_patterns = [r'@id=\d+@', r'@end=\d+@', r'<[^>]+>']
             print("[Auto-Config] Using EPUB_ANCHOR_PATTERNS for @id=ID@ anchors.")
-        elif args.alignment_mode:
+        elif alignment_reconstruction:
             # [Specialized Rule] 对齐模式基于 TXT：默认规则 + @id 锚点
             anchor_patterns = [r'@id=\d+@', r'@end=\d+@']
             custom_protector_patterns = _merge_protect_patterns(
@@ -1488,13 +1665,9 @@ def main():
 
     additions: List[str] = []
     removals: List[str] = []
-    if text_protect_allowed:
+    if allow_user_protect_customization:
         if protect_rule_lines:
             add, rem = _parse_protect_pattern_lines(protect_rule_lines)
-            additions.extend(add)
-            removals.extend(rem)
-        if legacy_protect_lines:
-            add, rem = _parse_protect_pattern_lines(legacy_protect_lines)
             additions.extend(add)
             removals.extend(rem)
 
@@ -1524,6 +1697,13 @@ def main():
             doc = None # Not used here
         else:
             doc = DocumentFactory.get_document(input_path)
+            if hasattr(doc, "set_runtime_context"):
+                doc.set_runtime_context(
+                    engine_mode="v1",
+                    chunk_type=args.mode,
+                    document_role="input",
+                    alignment_mode=alignment_reconstruction,
+                )
             items = doc.load()
             
             # Source Lines Calculation (for Novel/Chunk mode)
@@ -1584,8 +1764,8 @@ def main():
                     # [封装] 使用 clear() 方法，避免直接操作内部结构
                     translation_cache.clear()
         
-        # Load legacy/custom protection patterns file if provided via CLI
-        if text_protect_allowed and args.protect_patterns and os.path.exists(args.protect_patterns):
+        # Load custom protection patterns file if provided via CLI
+        if allow_user_protect_customization and args.protect_patterns and os.path.exists(args.protect_patterns):
              try:
                  with open(args.protect_patterns, 'r', encoding='utf-8') as f:
                      raw_text = f.read()
@@ -2112,7 +2292,7 @@ def main():
                         
                         # Emit preview as soon as a block finishes (out-of-order allowed)
                         if block_idx not in preview_sent:
-                            if args.alignment_mode:
+                            if alignment_reconstruction:
                                 preview_text = AlignmentHandler.process_result(result.get("out_text", ""))
                             else:
                                 preview_text = result.get("preview_text") or result.get("out_text", "")
@@ -2162,7 +2342,7 @@ def main():
                             # CRITICAL: Do NOT overwrite res["out_text"] with stripped version!
                             # We need the tags in "out_text" for save_reconstructed to work at the end.
                             # Only strip tags for the Preview/GUI.
-                            if args.alignment_mode:
+                            if alignment_reconstruction:
                                 if not res.get("preview_text"):
                                     res["preview_text"] = AlignmentHandler.process_result(res["out_text"])  
                             else:
@@ -2173,6 +2353,29 @@ def main():
                                     {"block": curr_disp, "src": res['src_text'], "output": res['preview_text']}
                                 )
                                 preview_sent.add(next_write_idx)
+
+                            warnings_list = res.get("warnings") or []
+                            retry_history = res.get("retry_history") or []
+                            last_retry_type = None
+                            if retry_history:
+                                try:
+                                    last_retry_type = retry_history[-1].get("type")
+                                except Exception:
+                                    last_retry_type = None
+                            if warnings_list:
+                                for warning in warnings_list:
+                                    if isinstance(warning, dict):
+                                        safe_print_json(
+                                            "JSON_WARNING",
+                                            {
+                                                "block": curr_disp,
+                                                "line": warning.get("line"),
+                                                "type": warning.get("type"),
+                                                "message": warning.get("message", ""),
+                                                "retry_count": len(retry_history),
+                                                "last_retry_type": last_retry_type,
+                                            },
+                                        )
                             
                             if translation_cache:
                                 w_types = [w['type'] for w in res["warnings"]] if res["warnings"] else []
@@ -2214,28 +2417,35 @@ def main():
                     raise ValueError(error_msg)
                 
                 print(f"[Final] Reconstructing structured document: {output_path}...")
-                from murasaki_translator.core.chunker import TextBlock
-                translated_blocks = []
-                for i in range(len(blocks)):
+                if args.alignment_mode and input_path.lower().endswith('.txt'):
+                    from murasaki_translator.core.chunker import TextBlock
+                    translated_blocks = [
+                        TextBlock(
+                            id=block.id,
+                            prompt_text=block.prompt_text,
+                            metadata=list(getattr(block, 'metadata', []) or []),
+                        )
+                        for block in blocks
+                    ]
+                else:
+                    translated_blocks = blocks
+                for i in range(len(translated_blocks)):
                     res = all_results[i]
                     if res and res.get('success'):
-                        # 构造 TextBlock 对象以满足 doc.save 的签名
-                        tb = TextBlock(id=i, prompt_text=res['out_text'])
-                        # 注入元数据以便 EPUB 精确回填
-                        if hasattr(blocks[i], 'metadata') and blocks[i].metadata:
-                            tb.metadata = blocks[i].metadata
-                        translated_blocks.append(tb)
+                        translated_blocks[i].prompt_text = res['out_text']
                     else:
                         # Fallback: keep original text to maintain the sequence for structural injection
                         print(f"[Warning] Block {i+1} missing or failed. Using source text.")
-                        tb = TextBlock(id=i, prompt_text=blocks[i].prompt_text)
-                        if hasattr(blocks[i], 'metadata') and blocks[i].metadata:
-                            tb.metadata = blocks[i].metadata
-                        translated_blocks.append(tb)
                 
                 if args.alignment_mode and input_path.lower().endswith('.txt'):
                     print(f"[Debug] Invoking save_reconstructed. MapSize={len(structure_map)}, TotalLines={source_lines}, Blocks={len(translated_blocks)}")
-                    AlignmentHandler.save_reconstructed(output_path, translated_blocks, structure_map, total_physical_lines=source_lines)
+                    AlignmentHandler.save_reconstructed(
+                        output_path,
+                        translated_blocks,
+                        structure_map,
+                        total_physical_lines=source_lines,
+                        source_blocks=blocks,
+                    )
                 else:
                     doc.save(output_path, translated_blocks)
                 print(f"[Final] Reconstruction complete: {output_path}")
@@ -2319,9 +2529,11 @@ def main():
                     for line in lines:
                         try:
                             data = json.loads(line.strip())
-                            if data.get('output'):
-                                rebuilt_blocks.append(data['output'])
-                        except: pass
+                            preview_text = _extract_interrupted_preview_text(data)
+                            if preview_text:
+                                rebuilt_blocks.append(preview_text)
+                        except Exception:
+                            pass
                     if rebuilt_blocks:
                         with open(rebuild_path, 'w', encoding='utf-8') as rf:
                             rf.write("\n\n".join(rebuilt_blocks))
@@ -2341,6 +2553,7 @@ def main():
         print(f"\n[System] Critical Error: {e}")
         import traceback
         traceback.print_exc()
+        sys.exit(1)
     finally:
         if 'temp_progress_file' in locals():
             try:

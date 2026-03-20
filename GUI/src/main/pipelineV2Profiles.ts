@@ -33,6 +33,7 @@ import {
   isPathWithin,
   safeLoadYaml,
   normalizeChunkType,
+  normalizeProfileCompatibility,
 } from "./pipelineV2Shared";
 import type { ApiStatsEventInput } from "./apiStatsStore";
 
@@ -139,8 +140,8 @@ const buildNextProfileIndexCache = (
   return { ...cache, kinds: nextKinds };
 };
 
-export const getPipelineV2ProfilesDir = () =>
-  join(app.getPath("userData"), "pipeline_v2_profiles");
+export const getPipelineV2ProfilesDir = (baseDir?: string) =>
+  join(baseDir || app.getPath("userData"), "pipeline_v2_profiles");
 
 type PythonPath = { type: "python" | "bundle"; path: string };
 
@@ -820,7 +821,7 @@ const listProfileRefsLocal = async (
 
         if (data?.name) name = String(data.name);
         if (kind === "chunk") {
-          const rawChunkType = String(data?.chunk_type || data?.type || "");
+          const rawChunkType = String(data?.chunk_type || "");
           const normalized = normalizeChunkType(rawChunkType);
           if (normalized) chunkType = normalized;
         }
@@ -923,6 +924,15 @@ const loadProfileLocal = async (
   const raw = await readFile(path, "utf-8");
 
   const data = safeLoadYaml(raw) || {};
+  let normalizedYaml = raw;
+  if (normalizeProfileCompatibility(kind, data)) {
+    normalizedYaml = dumpYaml(data);
+    try {
+      await writeFileSafely(path, normalizedYaml);
+    } catch {
+      // ignore compatibility writeback failures and continue in-memory
+    }
+  }
 
   const fallbackId = basename(path, extname(path));
   const rawId = String(data.id || "").trim();
@@ -930,7 +940,7 @@ const loadProfileLocal = async (
 
   const name = String(data.name || id);
 
-  return { id, name, yaml: raw, data };
+  return { id, name, yaml: normalizedYaml, data };
 };
 
 const saveProfileLocal = async (
@@ -959,10 +969,9 @@ const saveProfileLocal = async (
     return { ok: false, error: "invalid_id" };
   }
   parsed.id = rawId;
+  normalizeProfileCompatibility(kind, parsed);
   if (kind === "chunk") {
-    const normalized = normalizeChunkType(
-      parsed.chunk_type ?? parsed.type ?? "",
-    );
+    const normalized = normalizeChunkType(parsed.chunk_type ?? "");
     if (normalized) parsed.chunk_type = normalized;
   }
 
@@ -1426,7 +1435,9 @@ const deleteProfileLocal = async (
 };
 
 export const registerPipelineV2Profiles = (deps: ProfileDeps) => {
-  const getProfilesDir = deps.getProfilesDir || getPipelineV2ProfilesDir;
+  const getProfilesDir =
+    deps.getProfilesDir ||
+    (() => getPipelineV2ProfilesDir(deps.getMiddlewarePath()));
 
   const ensureServer = async () => {
     const currentStatus = getPipelineV2Status();

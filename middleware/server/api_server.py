@@ -25,6 +25,8 @@ import secrets
 import threading
 import subprocess
 import time
+import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -34,10 +36,15 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Uplo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
-# 添加父目录到 path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# 添加 server 目录和其父目录到 path（兼容打包后运行）
+_server_dir = Path(__file__).parent
+_middleware_dir = _server_dir.parent
+for _path in (_server_dir, _middleware_dir):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 
 from translation_worker import TranslationWorker, TranslationTask, TaskStatus
 
@@ -54,10 +61,26 @@ logger = logging.getLogger("murasaki-api")
 # ============================================
 # FastAPI App
 # ============================================
+
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        global worker
+        try:
+            if worker is not None:
+                worker.stop_server()
+        except Exception:
+            pass
+
+
 app = FastAPI(
     title="Murasaki Translation API",
     version="1.0.0",
-    description="Remote translation server with full GUI functionality"
+    description="Remote translation server with full GUI functionality",
+    lifespan=app_lifespan,
 )
 
 
@@ -202,6 +225,112 @@ def _mask_secret(value: str) -> str:
     return f"{normalized[:4]}...{normalized[-4:]}"
 
 
+def _default_models_dir() -> Path:
+    return Path(__file__).parent.parent / "models"
+
+
+def _resolve_model_path(raw_path: Optional[str]) -> Optional[Path]:
+    normalized = str(raw_path or "").strip()
+    if not normalized:
+        return None
+
+    try:
+        raw_candidate = Path(normalized).expanduser()
+    except Exception:
+        return None
+
+    candidates: List[Path] = []
+    if raw_candidate.is_absolute():
+        candidates.append(raw_candidate.resolve(strict=False))
+    else:
+        for base in (Path.cwd(), _middleware_dir, _server_dir):
+            try:
+                candidates.append((base / raw_candidate).resolve(strict=False))
+            except Exception:
+                continue
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.suffix.lower() != ".gguf":
+            continue
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        return candidate
+
+    return None
+
+
+def _collect_model_paths() -> List[Path]:
+    candidates: List[Path] = []
+    models_dir = _default_models_dir()
+    if models_dir.exists():
+        candidates.extend(models_dir.glob("*.gguf"))
+
+    configured_paths: List[str] = []
+    if worker is not None and getattr(worker, "model_path", None):
+        configured_paths.append(str(worker.model_path))
+
+    env_model = os.environ.get("MURASAKI_DEFAULT_MODEL", "").strip()
+    if env_model:
+        configured_paths.append(env_model)
+
+    for raw_path in configured_paths:
+        resolved = _resolve_model_path(raw_path)
+        if resolved is not None:
+            candidates.append(resolved)
+
+    deduped: List[Path] = []
+    seen = set()
+    for path in candidates:
+        resolved = _resolve_model_path(str(path))
+        if resolved is None:
+            continue
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(resolved)
+    deduped.sort(key=lambda value: str(value).lower())
+    return deduped
+
+
+_CUDA_DEVICE_TOKEN_PATTERN = re.compile(
+    r"^(?:-1|\d+|GPU-[A-Za-z0-9-]+|MIG-[A-Za-z0-9/-]+)$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_gpu_device_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    tokens = [token.strip() for token in re.split(r"[,;\s，；]+", raw) if token.strip()]
+    if not tokens:
+        return None
+
+    normalized: List[str] = []
+    seen = set()
+    for token in tokens:
+        if not _CUDA_DEVICE_TOKEN_PATTERN.match(token):
+            continue
+        canonical = str(int(token)) if token.isdigit() else token
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        normalized.append(canonical)
+
+    if not normalized:
+        return None
+    return ",".join(normalized)
+
+
 async def verify_api_key(api_key: str = Security(api_key_header)):
     """
     验证 API Key
@@ -233,8 +362,8 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
 # Global State
 # ============================================
 worker: Optional[TranslationWorker] = None
+_worker_lock = threading.Lock()
 tasks: Dict[str, TranslationTask] = {}
-websocket_connections: List[WebSocket] = []
 
 # HuggingFace download tasks (remote server side)
 hf_download_tasks: Dict[str, Dict[str, Any]] = {}
@@ -249,17 +378,6 @@ _tasks_lock = threading.Lock()
 TERMINAL_TASK_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
 
-@app.on_event("shutdown")
-def on_shutdown():
-    """Ensure llama-server is stopped when API server exits."""
-    global worker
-    try:
-        if worker is not None:
-            worker.stop_server()
-    except Exception:
-        pass
-
-
 def _set_task(task: TranslationTask) -> None:
     with _tasks_lock:
         tasks[task.task_id] = task
@@ -272,7 +390,7 @@ def _get_task(task_id: str) -> Optional[TranslationTask]:
 
 def _count_running_tasks() -> int:
     with _tasks_lock:
-        return len([t for t in tasks.values() if t.status == TaskStatus.RUNNING])
+        return len([t for t in tasks.values() if t.get_status() == TaskStatus.RUNNING])
 
 
 def _try_transition_task_status(task: TranslationTask, next_status: TaskStatus) -> bool:
@@ -281,17 +399,18 @@ def _try_transition_task_status(task: TranslationTask, next_status: TaskStatus) 
     - 终态不可回退（completed/failed/cancelled）
     - 相同状态幂等
     """
-    current_status = task.status
-    if current_status == next_status:
+    with task.with_state_lock():
+        current_status = task.status
+        if current_status == next_status:
+            return True
+        if current_status in TERMINAL_TASK_STATUSES:
+            logger.warning(
+                f"Ignored task status transition for {task.task_id}: "
+                f"{current_status.value} -> {next_status.value}"
+            )
+            return False
+        task.status = next_status
         return True
-    if current_status in TERMINAL_TASK_STATUSES:
-        logger.warning(
-            f"Ignored task status transition for {task.task_id}: "
-            f"{current_status.value} -> {next_status.value}"
-        )
-        return False
-    task.status = next_status
-    return True
 
 def cleanup_old_tasks():
     """清理旧任务，防止内存泄漏和磁盘泄漏"""
@@ -306,7 +425,7 @@ def cleanup_old_tasks():
         
         for task_id, task in list(tasks.items()):
             age_hours = (now - task.created_at).total_seconds() / 3600
-            if task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+            if task.get_status() in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
                 completed_count += 1
                 if age_hours > TASK_RETENTION_HOURS:
                     to_remove.append((task_id, task))
@@ -315,7 +434,7 @@ def cleanup_old_tasks():
         if completed_count > MAX_COMPLETED_TASKS:
             completed_tasks = [
                 (tid, t) for tid, t in list(tasks.items()) 
-                if t.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                if t.get_status() in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
             ]
             completed_tasks.sort(key=lambda x: x[1].created_at)
             for tid, t in completed_tasks[:completed_count - MAX_COMPLETED_TASKS]:
@@ -328,8 +447,9 @@ def cleanup_old_tasks():
             # 删除关联的物理文件（防止磁盘泄漏）
             try:
                 # 删除输出文件
-                if task.output_path:
-                    output_file = Path(task.output_path)
+                output_path = task.get_output_path()
+                if output_path:
+                    output_file = Path(output_path)
                     if output_file.exists():
                         output_file.unlink()
                         logger.debug(f"Deleted output file: {output_file}")
@@ -511,7 +631,7 @@ class TranslateRequest(BaseModel):
     gpu_layers: int = Field(
         default_factory=lambda: _parse_env_int("MURASAKI_DEFAULT_GPU_LAYERS", -1)
     )
-    temperature: float = 0.7
+    temperature: float = 0.3
     
     # 高级选项
     line_format: str = "single"
@@ -519,7 +639,7 @@ class TranslateRequest(BaseModel):
     line_check: bool = True
     line_tolerance_abs: int = 10
     line_tolerance_pct: float = 0.2
-    anchor_check: bool = True
+    anchor_check: bool = False
     anchor_check_retries: int = 1
     traditional: bool = False
     save_cot: bool = False
@@ -574,7 +694,8 @@ class TranslateRequest(BaseModel):
     )
     text_protect: bool = False
 
-    @validator("mode", pre=True)
+    @field_validator("mode", mode="before")
+    @classmethod
     def normalize_mode(cls, value: Optional[str]) -> str:
         raw = str(value or "").strip().lower()
         if raw in ("doc", "chunk"):
@@ -588,11 +709,17 @@ class TranslateRequest(BaseModel):
     fix_punctuation: bool = False
     gpu_device_id: Optional[str] = None
 
+    @field_validator("gpu_device_id", mode="before")
+    @classmethod
+    def normalize_gpu_device_id(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_gpu_device_id(value)
+
 
 class TranslateResponse(BaseModel):
     """翻译响应"""
     task_id: str
     status: str
+    message: str = ""
 
 class HfDownloadRequest(BaseModel):
     repo_id: str
@@ -678,18 +805,20 @@ async def get_status():
 )
 async def list_models():
     """列出服务器上可用的模型"""
-    models_dir = Path(__file__).parent.parent / "models"
-    models = []
-    
-    if models_dir.exists():
-        for f in models_dir.glob("*.gguf"):
-            size_gb = f.stat().st_size / (1024**3)
-            models.append(ModelInfo(
-                name=f.stem,
-                path=str(f),
-                size_gb=round(size_gb, 2)
-            ))
-    
+    models: List[ModelInfo] = []
+    for model_path in _collect_model_paths():
+        try:
+            size_gb = model_path.stat().st_size / (1024**3)
+        except OSError:
+            continue
+        models.append(
+            ModelInfo(
+                name=model_path.stem,
+                path=str(model_path),
+                size_gb=round(size_gb, 2),
+            )
+        )
+
     return models
 
 
@@ -853,53 +982,54 @@ async def get_task_status(
     if not task:
         raise HTTPException(404, f"Task {task_id} not found")
 
-    # 直接对 task.logs 取长度和切片，避免 list() 全量拷贝
-    # Python GIL 保证 len() 和 slice 操作的原子性
-    log_total = len(task.logs)
-    logs_truncated = False
-
-    if log_from is None:
-        # 兼容旧客户端：默认返回最近 50 条
-        start_index = max(0, log_total - 50)
-        logs = task.logs[start_index:]
-        logs_truncated = start_index > 0
-        next_log_index = start_index + len(logs)
-    else:
-        start_index = min(log_from, log_total)
-        end_index = min(log_total, start_index + log_limit)
-        logs = task.logs[start_index:end_index]
-        next_log_index = start_index + len(logs)
+    snapshot = task.snapshot_status(log_from=log_from, log_limit=log_limit)
+    status = snapshot["status"]
 
     return TaskStatusResponse(
         task_id=task_id,
-        status=task.status.value,
-        progress=task.progress,
-        current_block=task.current_block,
-        total_blocks=task.total_blocks,
-        logs=logs,
-        next_log_index=next_log_index,
-        log_total=log_total,
-        logs_truncated=logs_truncated,
-        result=task.result,
-        error=task.error
+        status=status.value,
+        progress=snapshot["progress"],
+        current_block=snapshot["current_block"],
+        total_blocks=snapshot["total_blocks"],
+        logs=snapshot["logs"],
+        next_log_index=snapshot["next_log_index"],
+        log_total=snapshot["log_total"],
+        logs_truncated=snapshot["logs_truncated"],
+        result=snapshot["result"],
+        error=snapshot["error"],
     )
 
 
 @app.delete("/api/v1/translate/{task_id}", dependencies=[Depends(verify_api_key)])
 async def cancel_task(task_id: str):
     """取消任务"""
+    global worker
     task = _get_task(task_id)
     if not task:
         raise HTTPException(404, f"Task {task_id} not found")
-    if task.status in [TaskStatus.PENDING, TaskStatus.RUNNING]:
-        task.cancel_requested = True
-        if task.status == TaskStatus.PENDING:
+    current_status = task.get_status()
+    if current_status in [TaskStatus.PENDING, TaskStatus.RUNNING]:
+        task.request_cancel()
+        if current_status == TaskStatus.PENDING:
             _try_transition_task_status(task, TaskStatus.CANCELLED)
             task.add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Cancelled before start")
             return {"message": "Task cancelled before start"}
+        # RUNNING: best-effort immediate kill to reduce cancel latency.
+        process = task.get_process()
+        if process is not None and worker is not None:
+            try:
+                await worker._kill_process_tree(process)
+                task.set_process(None)
+                _try_transition_task_status(task, TaskStatus.CANCELLED)
+                task.add_log(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] Cancelled by user (immediate stop)."
+                )
+                return {"message": "Task cancelled"}
+            except Exception as e:
+                logger.warning("Immediate cancel failed for task %s: %s", task_id, e)
         return {"message": "Cancel requested"}
     else:
-        return {"message": f"Task is {task.status.value}, cannot cancel"}
+        return {"message": f"Task is {current_status.value}, cannot cancel"}
 
 
 @app.post("/api/v1/upload/file", dependencies=[Depends(verify_api_key)])
@@ -909,7 +1039,8 @@ async def upload_file(file: UploadFile = File(...)):
     upload_dir.mkdir(exist_ok=True)
     
     file_id = str(uuid.uuid4())[:8]
-    file_ext = Path(file.filename).suffix
+    original_name = file.filename or "upload.bin"
+    file_ext = Path(original_name).suffix
     save_path = upload_dir / f"{file_id}{file_ext}"
     
     total_size = 0
@@ -925,7 +1056,7 @@ async def upload_file(file: UploadFile = File(...)):
     return {
         "file_id": file_id,
         "file_path": str(save_path),
-        "original_name": file.filename,
+        "original_name": original_name,
         "size": total_size
     }
 
@@ -937,10 +1068,11 @@ async def download_cache(task_id: str):
     if not task:
         raise HTTPException(404, f"Task {task_id} not found")
     
-    if not task.output_path:
+    output_path = task.get_output_path()
+    if not output_path:
         raise HTTPException(404, "No output path available")
-    
-    cache_path = task.output_path + ".cache.json"
+
+    cache_path = output_path + ".cache.json"
     if not os.path.exists(cache_path):
         raise HTTPException(404, "Cache file not found")
     
@@ -952,11 +1084,13 @@ async def download_result(task_id: str):
     task = _get_task(task_id)
     if not task:
         raise HTTPException(404, f"Task {task_id} not found")
-    if task.status != TaskStatus.COMPLETED:
-        raise HTTPException(400, f"Task is {task.status.value}, not completed")
-    
-    if task.output_path and Path(task.output_path).exists():
-        output_file = Path(task.output_path).resolve()
+    current_status = task.get_status()
+    if current_status != TaskStatus.COMPLETED:
+        raise HTTPException(400, f"Task is {current_status.value}, not completed")
+
+    output_path = task.get_output_path()
+    if output_path and Path(output_path).exists():
+        output_file = Path(output_path).resolve()
         outputs_dir = (Path(__file__).parent.parent / "outputs").resolve()
         if not _is_path_within(output_file, outputs_dir):
             raise HTTPException(400, "Unsafe output path")
@@ -980,7 +1114,6 @@ async def websocket_logs(websocket: WebSocket, task_id: str):
             return
 
     await websocket.accept()
-    websocket_connections.append(websocket)
     
     try:
         task = _get_task(task_id)
@@ -988,34 +1121,32 @@ async def websocket_logs(websocket: WebSocket, task_id: str):
             await websocket.send_json({"error": f"Task {task_id} not found"})
             return
         last_log_index = 0
-        
+
         while True:
-            # 发送新日志
-            if len(task.logs) > last_log_index:
-                new_logs = task.logs[last_log_index:]
-                for log in new_logs:
-                    await websocket.send_json({
-                        "type": "log",
-                        "message": log
-                    })
-                last_log_index = len(task.logs)
-            
+            snapshot = task.snapshot_realtime(log_from=last_log_index)
+            for log in snapshot["logs"]:
+                await websocket.send_json({
+                    "type": "log",
+                    "message": log
+                })
+            last_log_index = snapshot["next_log_index"]
+
             # 发送进度
             await websocket.send_json({
                 "type": "progress",
-                "progress": task.progress,
-                "current_block": task.current_block,
-                "total_blocks": task.total_blocks,
-                "status": task.status.value
+                "progress": snapshot["progress"],
+                "current_block": snapshot["current_block"],
+                "total_blocks": snapshot["total_blocks"],
+                "status": snapshot["status"].value
             })
-            
+
             # 任务完成则退出
-            if task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+            if snapshot["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
                 await websocket.send_json({
                     "type": "complete",
-                    "status": task.status.value,
-                    "result": task.result,
-                    "error": task.error
+                    "status": snapshot["status"].value,
+                    "result": snapshot["result"],
+                    "error": snapshot["error"]
                 })
                 break
             
@@ -1023,9 +1154,6 @@ async def websocket_logs(websocket: WebSocket, task_id: str):
             
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for task {task_id}")
-    finally:
-        if websocket in websocket_connections:
-            websocket_connections.remove(websocket)
 
 
 # ============================================
@@ -1038,7 +1166,7 @@ async def execute_translation(task: TranslationTask):
     
     try:
         # 若任务在排队期间已被取消，直接结束
-        if task.cancel_requested or task.status == TaskStatus.CANCELLED:
+        if task.is_cancel_requested() or task.get_status() == TaskStatus.CANCELLED:
             _try_transition_task_status(task, TaskStatus.CANCELLED)
             task.add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Translation skipped (cancelled).")
             return
@@ -1049,27 +1177,30 @@ async def execute_translation(task: TranslationTask):
         
         # 确保 worker 已初始化
         if worker is None:
-            worker = TranslationWorker()
+            with _worker_lock:
+                if worker is None:
+                    worker = TranslationWorker()
         
         # 执行翻译
         result = await worker.translate(task)
 
         # 任务在 worker 内可能已被标记为取消，避免被 completed 覆盖
-        if task.status == TaskStatus.CANCELLED:
+        if task.get_status() == TaskStatus.CANCELLED:
             task.add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Translation cancelled.")
             return
 
-        task.result = result
+        task.set_result(result)
         if _try_transition_task_status(task, TaskStatus.COMPLETED):
-            task.progress = 1.0
+            _, current_block, total_blocks = task.get_progress()
+            task.set_progress(1.0, current_block, total_blocks)
             task.add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Translation completed!")
-        
+
     except Exception as e:
-        if task.status == TaskStatus.CANCELLED:
+        if task.get_status() == TaskStatus.CANCELLED:
             task.add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Translation cancelled.")
             return
         if _try_transition_task_status(task, TaskStatus.FAILED):
-            task.error = str(e)
+            task.set_error(str(e))
             task.add_log(f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: {e}")
             logger.exception(f"Translation failed for task {task.task_id}")
 

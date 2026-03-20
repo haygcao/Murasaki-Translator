@@ -9,10 +9,10 @@ import {
   Info,
   X,
   RefreshCw,
-  Server,
   Sparkles,
 } from "lucide-react";
 import { Button, Card, CardContent, Switch } from "./ui/core";
+import { Select } from "./ui/Select";
 import { translations, Language } from "../lib/i18n";
 import { AlertModal } from "./ui/AlertModal";
 import { useAlertModal } from "../hooks/useAlertModal";
@@ -109,7 +109,7 @@ export function ServiceView({
     autoConnectRemoteAfterDaemonStart,
     setAutoConnectRemoteAfterDaemonStart,
   ] = useState(() =>
-    parseBooleanStorage(LOCAL_DAEMON_AUTO_REMOTE_STORAGE_KEY, true),
+    parseBooleanStorage(LOCAL_DAEMON_AUTO_REMOTE_STORAGE_KEY, false),
   );
   const [serviceGuideExpanded, setServiceGuideExpanded] = useState(
     () => localStorage.getItem(SERVICE_GUIDE_EXPANDED_STORAGE_KEY) === "true",
@@ -657,7 +657,7 @@ export function ServiceView({
 
   const resolveLocalLogPath = async (fileName: string) => {
     try {
-      // @ts-ignore
+// @ts-ignore - Preload bridge typing is intentionally relaxed.
       const modelsPath = await (window as any).api?.getModelsPath?.();
       if (!modelsPath) return fileName;
       const sep = modelsPath.includes("\\") ? "\\" : "/";
@@ -877,7 +877,7 @@ export function ServiceView({
                       <label className="text-xs font-medium text-muted-foreground">
                         {s.hostLabel}
                       </label>
-                      <select
+                      <Select
                         className="w-full border border-border p-2 rounded bg-secondary text-foreground text-sm"
                         value={localHost}
                         onChange={(event) => {
@@ -890,7 +890,7 @@ export function ServiceView({
                       >
                         <option value="127.0.0.1">{s.hostLocal}</option>
                         <option value="0.0.0.0">{s.hostLan}</option>
-                      </select>
+                      </Select>
                     </div>
                   </div>
 

@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { Dashboard } from "./components/Dashboard";
 import { SettingsView } from "./components/SettingsView";
@@ -13,6 +13,8 @@ import { ApiManagerView } from "./components/ApiManagerView";
 import { Language, translations } from "./lib/i18n";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useAppHotkeys } from "./lib/useHotkeys";
+import { persistLibraryQueue } from "./lib/libraryQueueStorage";
+import type { QueueItem } from "./types/common";
 
 import { RuleEditor } from "./components/RuleEditor";
 import { AlertModal } from "./components/ui/AlertModal";
@@ -30,10 +32,39 @@ export type View =
   | "glossary"
   | "pre"
   | "post"
-  | "service"
   | "advanced"
   | "history"
   | "proofread";
+
+const WATCH_FALLBACK_EXTENSIONS = [".txt", ".epub", ".srt", ".ass", ".ssa", ".xlsx"];
+
+const detectFileType = (
+  path: string,
+): "txt" | "epub" | "srt" | "ass" | "ssa" | "xlsx" | "unknown" => {
+  const ext = "." + path.split(".").pop()?.toLowerCase();
+  if (WATCH_FALLBACK_EXTENSIONS.includes(ext)) {
+    return ext.slice(1) as "txt" | "epub" | "srt" | "ass" | "ssa" | "xlsx";
+  }
+  return "unknown";
+};
+
+const buildFallbackQueueItem = (
+  path: string,
+  fileType: "txt" | "epub" | "srt" | "ass" | "ssa" | "xlsx",
+): QueueItem => ({
+  id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+  path,
+  fileName: path.split(/[/\\]/).pop() || path,
+  fileType,
+  addedAt: new Date().toISOString(),
+  config: { useGlobalDefaults: true },
+  status: "pending" as const,
+});
+
+const isQueueItem = (value: unknown): value is QueueItem =>
+  !!value &&
+  typeof value === "object" &&
+  typeof (value as { path?: unknown }).path === "string";
 
 function AppContent() {
   const [lang, setLang] = useState<Language>(() => {
@@ -63,7 +94,6 @@ function AppContent() {
         "api_manager",
         "settings",
         "model",
-        "service",
         "advanced",
         "glossary",
         "proofread",
@@ -74,6 +104,7 @@ function AppContent() {
 
       if (validViews.includes(newView as View)) {
         const executeSwitch = () => {
+          window.api?.reportActiveView?.(newView as View);
           setView(newView as View);
         };
 
@@ -102,6 +133,36 @@ function AppContent() {
     onStopTranslation: () => dashboardRef.current?.stopTranslation?.(),
     onSwitchView: handleSwitchView,
   });
+
+  useEffect(() => {
+    window.api?.reportActiveView?.(view);
+  }, [view]);
+
+  useEffect(() => {
+    const unsubscribe = window.api?.onWatchFolderFileAdded?.((payload) => {
+      if (!payload?.path) return;
+      if (view === "library") return;
+      const fileType = detectFileType(payload.path);
+      if (fileType === "unknown") return;
+      try {
+        const raw = localStorage.getItem("library_queue");
+        const parsed = raw ? JSON.parse(raw) : [];
+        const queue = Array.isArray(parsed) ? parsed.filter(isQueueItem) : [];
+        if (queue.some((item) => String(item.path || "") === payload.path)) return;
+        const nextQueue = [
+          ...queue,
+          buildFallbackQueueItem(payload.path, fileType),
+        ];
+        persistLibraryQueue(nextQueue);
+        window.dispatchEvent(new CustomEvent("murasaki:library-queue-updated"));
+      } catch (error) {
+        console.error("[App] Watch fallback enqueue failed:", error);
+      }
+    });
+    return () => {
+      unsubscribe?.();
+    };
+  }, [view]);
 
   return (
     <div className="flex h-screen w-screen bg-background font-sans text-foreground overflow-hidden">
